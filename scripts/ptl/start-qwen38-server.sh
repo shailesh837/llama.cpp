@@ -65,7 +65,7 @@ for f in sys.argv[1:]:
 
 LOG=${LOG:-$ROOT/qwen38-server-$(date +%Y%m%d-%H%M).log}
 setsid nohup taskset -c "$CPUS" "$BIN" -m "$MODEL" -lm dio -lzm on -ngl 99 -fa on \
-    --jinja --reasoning off --no-reasoning-preserve \
+    --jinja --reasoning off --reasoning-preserve \
     -c "$CTX" -np 1 -b 4096 -ub 2048 \
     -md "$MTP" -ngld 99 --spec-type draft-mtp --spec-draft-n-max 5 --spec-draft-p-min 0.5 \
     -cram 0 --alias "$ALIAS" --host "$HOST" --port "$PORT" > "$LOG" 2>&1 < /dev/null &

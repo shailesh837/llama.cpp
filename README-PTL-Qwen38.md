@@ -147,7 +147,7 @@ export GGML_SYCL_XMX_Q2_0=1 GGML_SYCL_DYNAMIC_PRECISION=BF16 GGML_SYCL_DNNL_FPMA
 export GGML_SYCL_SPARSE_FA=1 GGML_SYCL_SPARSE_FA_ROWS=8 GGML_SYCL_FA_SKIP_MASKED=1
 taskset -c 0-3 build/bin/llama-server \
     -m ~/models/Q2_0_hcq8/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf \
-    -lm dio -lzm on -ngl 99 -fa on --jinja --reasoning off --no-reasoning-preserve \
+    -lm dio -lzm on -ngl 99 -fa on --jinja --reasoning off --reasoning-preserve \
     -c 65536 -np 1 -b 4096 -ub 2048 \
     -md ~/models/mtp/mtp-Qwen3.8-Flash-Next-Q4_0.gguf -ngld 99 \
     --spec-type draft-mtp --spec-draft-n-max 5 --spec-draft-p-min 0.5 \
@@ -161,6 +161,7 @@ Notes:
 - `-lzm on` reads the 27 GB n-gram embedding table (`per_layer_token_embd`) from disk on demand instead of keeping it in RAM.
 - `-c 65536` leaves ~14 GB of RAM free after the load on a 61 GiB machine. The model is served as `qwen38-flash-next-q2_0-mtp`.
 - Prompt processing: ~225 tok/s on long prompts (34k tokens in ~150 s). Follow-up turns reuse the cached prefix, so only new content (file reads, tool results) is processed.
+- `--reasoning-preserve` (the llama-server default) keeps earlier assistant turns in the history exactly as they were generated. With `--no-reasoning-preserve` the chat template drops the think block of every assistant turn before the last user message. In agent sessions (opencode, tool calls) the turns of the previous round were cached with their think block, so the next user message no longer matches the KV cache from the first assistant turn of that round, and all tool results since then are processed again (reported: 75-86 s instead of ~4 s per follow-up at long context). Plain chat, 5 follow-ups at 8-13k context: 160 tokens of prefill with preserve vs 245-1,209 without.
 - `-cram 0` turns off the host-RAM prompt cache, which grew 120-230 MB per request until 8 GB and pushed the machine into swap with `-c 65536`. SYCL graphs (`GGML_SYCL_ENABLE_GRAPH`) stay off: with MTP no graph is replayed and the graph cache grows ~110 MB per request.
 - Run only one GPU job (server, benchmark, test) at a time.
 
