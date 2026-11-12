@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # Qwen3.8-Flash-Next Q2_0 + MTP on Intel Panther Lake (Arc B390 iGPU), llama.cpp SYCL.
-# Verified setup: 30.1 tok/s decode over Agents4PLC (strict pass 66.7 %), prefill ~225 tok/s at 34k context.
+# Verified setup: 41.1 tok/s decode over Agents4PLC (strict pass 67.5 %), prefill ~225 tok/s at 34k context.
 # No root needed.
+#
+# THINK=1 (default): thinking on, reasoning effort medium, --reasoning-preserve (agent use, e.g. opencode).
+# THINK=0: thinking off, --no-reasoning-preserve (the setup of the Agents4PLC numbers).
 #
 #   MODEL_DIR=/path/to/models HOST=0.0.0.0 PORT=8601 scripts/ptl/start-qwen38-server.sh
 #
@@ -53,6 +56,31 @@ if [ "$NEW" = 1 ]; then
     export GGML_SYCL_BF16_FAST=1 GGML_SYCL_TOP_K_MASK=1
     export GGML_SYCL_XMX_Q2_0=1 GGML_SYCL_DYNAMIC_PRECISION=BF16 GGML_SYCL_DNNL_FPMATH=bf16
     export GGML_SYCL_SPARSE_FA=1 GGML_SYCL_SPARSE_FA_ROWS=8 GGML_SYCL_FA_SKIP_MASKED=1
+    # GGML_SYCL_XMX_PTL=1           MTP verify (2..8 rows) of the dense K-quant weights on the XMX units (Xe3)
+    # LLAMA_MTP_SHORTLIST=<file>     the MTP drafter computes logits only for the listed tokens (lossless)
+    export GGML_SYCL_XMX_PTL=1
+    export LLAMA_MTP_SHORTLIST=${SHORTLIST:-$ROOT/scripts/ptl/mtp-shortlist-plc-96k.txt}
+    # 12 Nov (KERN=0 turns these off):
+    # GGML_SYCL_MMID_SHARED=1        Q2_0 experts of all MTP verify rows in one launch, a repeated expert read once
+    # GGML_SYCL_TINY_FUSE=7          merged tiny kernels (unary chains, add runs, copy runs)
+    # LLAMA_QWEN4EXP_CONV_STATE_NOCONT=1   one copy less per recurrent-state slot
+    if [ "${KERN:-1}" = 1 ]; then
+        export GGML_SYCL_MMID_SHARED=1 GGML_SYCL_TINY_FUSE=7 LLAMA_QWEN4EXP_CONV_STATE_NOCONT=1
+    fi
+fi
+# Drafts: MTP, 5 tokens, p-min 0.5. SPEC=1 (default): n-gram drafts of 3-7 tokens in front of MTP (re-emitted code)
+# and probabilistic MTP drafts. Keep the n-gram n-max at 7 or less: a verify of more than 8 rows leaves the 8-row
+# fast paths and gets much slower. SPEC=0: MTP only, greedy drafts.
+SPEC_ARGS="--spec-type draft-mtp --spec-draft-n-max 5 --spec-draft-p-min 0.5"
+if [ "${SPEC:-1}" = 1 ]; then
+    SPEC_ARGS="--spec-type ngram-mod,draft-mtp --spec-ngram-mod-n-min 3 --spec-ngram-mod-n-max 7"
+    SPEC_ARGS="$SPEC_ARGS --spec-ngram-mod-n-match 24 --spec-draft-n-max 5 --spec-draft-p-min 0.5"
+    SPEC_ARGS="$SPEC_ARGS --spec-draft-sampling probabilistic"
+fi
+if [ "${THINK:-1}" = 1 ]; then
+    THINK_ARGS="--reasoning on --reasoning-preserve --reasoning-effort ${EFFORT:-medium}"
+else
+    THINK_ARGS="--reasoning off --no-reasoning-preserve"
 fi
 # SYCL graphs stay off (GGML_SYCL_ENABLE_GRAPH unset): with MTP no graph is replayed and the cache grows per request.
 # -cram 0: no host prompt cache (it grew 120-230 MB per request); the slot still reuses the prefix of the last request.
@@ -65,9 +93,9 @@ for f in sys.argv[1:]:
 
 LOG=${LOG:-$ROOT/qwen38-server-$(date +%Y%m%d-%H%M).log}
 setsid nohup taskset -c "$CPUS" "$BIN" -m "$MODEL" -lm dio -lzm on -ngl 99 -fa on \
-    --jinja --reasoning off --reasoning-preserve \
+    --jinja $THINK_ARGS \
     -c "$CTX" -np 1 -b 4096 -ub 2048 \
-    -md "$MTP" -ngld 99 --spec-type draft-mtp --spec-draft-n-max 5 --spec-draft-p-min 0.5 \
+    -md "$MTP" -ngld 99 $SPEC_ARGS \
     -cram 0 --alias "$ALIAS" --host "$HOST" --port "$PORT" > "$LOG" 2>&1 < /dev/null &
 PID=$!
 echo "pid $PID, log $LOG"

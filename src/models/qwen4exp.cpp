@@ -4,6 +4,7 @@
 #include "llama-memory-recurrent.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cinttypes>
 
 // bad metadata must be catchable: GGML_ASSERT aborts the whole process
@@ -187,7 +188,17 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
     hc_head_down = create_tensor(tn(LLM_TENSOR_HC_HEAD_DOWN, "weight"), { hc_dim, hc_lr }, trunk_flags);
     hc_head_up   = create_tensor(tn(LLM_TENSOR_HC_HEAD_UP,   "weight"), { hc_lr, hc_dim }, trunk_flags);
 
-    output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
+    // reduced draft vocabulary (optional, MTP drafter files): the output head has one row per d2t
+    // entry and d2t holds the token id of each row. Made by scripts/ptl/mtp_shortlist.py.
+    int64_t n_vocab_out = n_vocab;
+    if (const ggml_tensor * d2t_meta = ml.get_tensor_meta("d2t")) {
+        n_vocab_out = d2t_meta->ne[0];
+        d2t = create_tensor(tn(LLM_TENSOR_D2T), { n_vocab_out }, 0);
+        LLAMA_LOG_INFO("%s: output head reduced to %lld of %lld tokens (d2t)\n", __func__,
+                (long long) n_vocab_out, (long long) n_vocab);
+    }
+
+    output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab_out }, d2t ? 0 : TENSOR_NOT_REQUIRED);
     if (output == NULL) {
         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
     }
@@ -320,6 +331,26 @@ static ggml_tensor * hc_stream_mean(ggml_context * ctx, ggml_tensor * x) {
     }
 
     return ggml_scale(ctx, acc, 1.0f / (float) hc);
+}
+
+// Reduced draft vocabulary: scatter the [n_draft_vocab, n_outputs] logits of a short output head
+// into full rows of -inf, so sampling sees the usual [n_vocab, n_outputs] logits (as eagle3/dflash).
+static ggml_tensor * qwen4exp_scatter_d2t(ggml_context * ctx0, const llama_model & model, ggml_tensor * cur) {
+    if (!model.d2t) {
+        return cur;
+    }
+    const int64_t n_draft_vocab = cur->ne[0];
+    const int64_t n_outputs     = cur->ne[1];
+    const int64_t n_vocab       = (int64_t) model.vocab.n_tokens();
+
+    GGML_ASSERT(model.d2t->type == GGML_TYPE_I64);
+    GGML_ASSERT(model.d2t->ne[0] == n_draft_vocab);
+
+    ggml_tensor * logits = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_vocab, n_outputs), -INFINITY);
+    cur = ggml_set_rows(ctx0, logits,
+            ggml_reshape_3d(ctx0, cur,       1,             n_draft_vocab, n_outputs),
+            ggml_reshape_3d(ctx0, model.d2t, n_draft_vocab, 1,             1));
+    return ggml_reshape_2d(ctx0, cur, n_vocab, n_outputs);
 }
 
 // Hyper-connections keep hc parallel residual streams [n_embd, hc, T] in place of layer norms.
@@ -535,6 +566,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     res->t_embd = cur;
 
     cur = build_lora_mm(model.output, cur, model.output_s);
+    cur = qwen4exp_scatter_d2t(ctx0, model, cur);
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 }
@@ -628,7 +660,18 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    cur = build_lora_mm(model.output, cur, model.output_s);
+    if (model.output_short && cur->ne[1] > 0) {
+        // LLAMA_MTP_SHORTLIST: logits of the listed tokens, scattered into a -inf row of the full vocabulary
+        ggml_tensor * ls   = ggml_mul_mat(ctx0, model.output_short, cur);                  // [n_short, n_out]
+        const int64_t n_out   = ls->ne[1];
+        const int64_t n_vocab = model.output->ne[1];
+        ggml_tensor * full = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_vocab, n_out), -INFINITY);
+        full = ggml_set_rows(ctx0, full, ggml_reshape_3d(ctx0, ls, 1, ls->ne[0], n_out), model.output_short_ids);
+        cur  = ggml_reshape_2d(ctx0, full, n_vocab, n_out);
+    } else {
+        cur = build_lora_mm(model.output, cur, model.output_s);
+        cur = qwen4exp_scatter_d2t(ctx0, model, cur);
+    }
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 }
@@ -1369,7 +1412,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
                 conv_states_all->nb[1],
                 (slot * mem_size + kv_head) * row_size);
 
-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, tail), dst));
+        // LLAMA_QWEN4EXP_CONV_STATE_NOCONT=1 (local-speedup): copy the strided tail straight into its
+        // slot instead of making it contiguous first; one launch less per slot (216 per token)
+        static const bool nocont = getenv("LLAMA_QWEN4EXP_CONV_STATE_NOCONT") != nullptr &&
+                                   atoi(getenv("LLAMA_QWEN4EXP_CONV_STATE_NOCONT")) != 0;
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, nocont ? tail : ggml_cont(ctx0, tail), dst));
     }
 
     return conv_input;

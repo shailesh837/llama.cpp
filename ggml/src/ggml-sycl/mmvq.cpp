@@ -3897,3 +3897,226 @@ void ggml_sycl_mul_mat_vec_q2_0_fast_id(const void * vx_base, const void * vy, c
     }
 #undef Q2V2
 }
+
+// =============================================================================================
+// Q2_0 expert kernel, shared across tokens (GGML_SYCL_MMID_SHARED=1, MTP verify with 2..8 tokens).
+// One launch for all tokens. A work-group belongs to one (token, slot) pair. If an earlier token
+// picked the same expert, it does nothing: the first token that picked an expert computes the
+// rows of that expert for every later token that picked it too, so the weights of each expert
+// are read and unpacked once. Per (token, slot) the terms and their order are those of
+// q2v2_pair_dot.
+// =============================================================================================
+bool ggml_sycl_mmid_shared_enabled() {
+    static const int mode = [] {
+        const char * e = getenv("GGML_SYCL_MMID_SHARED");
+        return e != nullptr ? atoi(e) : 0;
+    }();
+    return mode != 0;
+}
+
+#define Q2V2_SHARED_MAX_TOKENS 8
+
+template <int LPR>
+static void mul_mat_vec_q2v2_moe_shared(const void * __restrict__ vx_base, const void * __restrict__ vy_base,
+                                        float * __restrict__ dst_base, const int32_t * __restrict__ ids_dev,
+                                        const int ncols, const int nrows, const int n_tokens, const int n_used,
+                                        const size_t ids_stride_e, const size_t ids_stride_t,
+                                        const size_t expert_weight_stride, const size_t dst_stride_e,
+                                        const size_t dst_stride_t, const size_t vy_stride_e,
+                                        const size_t vy_stride_t, const sycl::nd_item<3> & it) {
+    constexpr int RPS  = WARP_SIZE / LPR;   // rows per sub-group
+    const int     slot = it.get_group(1);
+    const int     t0   = slot / n_used;
+    const int     e0   = slot - t0 * n_used;
+
+    const char * ids = (const char *) ids_dev;
+    const int    i02 = *(const int32_t *) (ids + (size_t) t0 * ids_stride_t + (size_t) e0 * ids_stride_e);
+
+    // Uniform over the work-group: has an earlier token picked this expert?
+    bool owner = true;
+    for (int t = 0; t < t0; ++t) {
+        for (int e = 0; e < n_used; ++e) {
+            owner = owner && *(const int32_t *) (ids + (size_t) t * ids_stride_t + (size_t) e * ids_stride_e) != i02;
+        }
+    }
+    if (!owner) {
+        return;   // whole work-group
+    }
+
+    // The (token, slot) pairs this work-group serves: member 0 is its own, member m is token t0 + m if
+    // that token picked the same expert. All of this is uniform over the work-group. The member loops
+    // are unrolled with constant indices so that the small arrays stay in registers.
+    const int8_t * mvy[Q2V2_SHARED_MAX_TOKENS];
+    float *        mdst[Q2V2_SHARED_MAX_TOKENS];
+    bool           mok[Q2V2_SHARED_MAX_TOKENS];
+#pragma unroll
+    for (int m = 0; m < Q2V2_SHARED_MAX_TOKENS; ++m) {
+        const int t     = t0 + m;
+        int       e_hit = m == 0 ? e0 : -1;
+        if (m > 0 && t < n_tokens) {
+            for (int e = 0; e < n_used; ++e) {
+                if (*(const int32_t *) (ids + (size_t) t * ids_stride_t + (size_t) e * ids_stride_e) == i02) {
+                    e_hit = e;
+                }
+            }
+        }
+        mok[m] = e_hit >= 0;
+        // an unused member points at member 0 and is never read or written
+        const int tt = mok[m] ? t : t0;
+        const int ee = mok[m] ? e_hit : e0;
+        mvy[m]  = (const int8_t *) vy_base + (size_t) tt * vy_stride_t + (size_t) ee * vy_stride_e;
+        mdst[m] = (float *) ((char *) dst_base + (size_t) tt * dst_stride_t + (size_t) ee * dst_stride_e);
+    }
+
+    const uint8_t * vx = (const uint8_t *) vx_base + (size_t) i02 * expert_weight_stride;
+
+    const auto sg   = it.get_sub_group();
+    const int  lane = sg.get_local_linear_id();
+    const int  sgid = it.get_group(2) * sg.get_group_linear_range() + sg.get_group_linear_id();
+    const int  row  = sgid * RPS + lane / LPR;
+    const int  l    = lane % LPR;
+
+    const int bpr = ncols / QK2_0;
+    const int ppr = bpr / 2;
+
+    float sum[Q2V2_SHARED_MAX_TOKENS];
+#pragma unroll
+    for (int m = 0; m < Q2V2_SHARED_MAX_TOKENS; ++m) {
+        sum[m] = 0.0f;
+    }
+
+    if (row < nrows) {
+        const uint32_t * wrow = reinterpret_cast<const uint32_t *>(vx + (size_t) row * bpr * sizeof(block_q2_0));
+        for (int p = l; p < ppr; p += LPR) {
+            const uint32_t * wq = wrow + 9 * p;
+            uint32_t         w[9];
+#pragma unroll
+            for (int i = 0; i < 9; ++i) {
+                w[i] = wq[i];
+            }
+            // bytes: [d0 | qs0 (16) | d1 | qs1 (16)], as in q2v2_pair_dot
+            uint32_t q[8];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                q[j]     = (w[j] >> 16) | (w[j + 1] << 16);
+                q[4 + j] = w[5 + j];
+            }
+            const float d0 = (float) sycl::bit_cast<sycl::half>((uint16_t) (w[0] & 0xFFFFu));
+            const float d1 = (float) sycl::bit_cast<sycl::half>((uint16_t) (w[4] >> 16));
+
+            // per-pair partial sums, added to the lane sums after the pair: the association of
+            // q2v2_pair_dot, so each value is bit-identical to the one-token kernel
+            float psum[Q2V2_SHARED_MAX_TOKENS];
+#pragma unroll
+            for (int m = 0; m < Q2V2_SHARED_MAX_TOKENS; ++m) {
+                psum[m] = 0.0f;
+            }
+
+#pragma unroll
+            for (int hb = 0; hb < 4; ++hb) {   // the four q8_1 blocks of 32 weights
+                const uint32_t qa = q[2 * hb];
+                const uint32_t qb = q[2 * hb + 1];
+                const int      s0 = q2v2_spread(qa & 0xFFu);
+                const int      s1 = q2v2_spread((qa >> 8) & 0xFFu);
+                const int      s2 = q2v2_spread((qa >> 16) & 0xFFu);
+                const int      s3 = q2v2_spread(qa >> 24);
+                const int      s4 = q2v2_spread(qb & 0xFFu);
+                const int      s5 = q2v2_spread((qb >> 8) & 0xFFu);
+                const int      s6 = q2v2_spread((qb >> 16) & 0xFFu);
+                const int      s7 = q2v2_spread(qb >> 24);
+                const float    d  = hb < 2 ? d0 : d1;
+
+#pragma unroll
+                for (int m = 0; m < Q2V2_SHARED_MAX_TOKENS; ++m) {
+                    if (mok[m]) {
+                        const sycl::int4 * a4 = reinterpret_cast<const sycl::int4 *>(mvy[m] + 128 * p);
+                        const sycl::int4   u0 = a4[2 * hb];
+                        const sycl::int4   u1 = a4[2 * hb + 1];
+                        int                s  = dpct::dp4a(s0, u0.x(), 0);
+                        s                     = dpct::dp4a(s1, u0.y(), s);
+                        s                     = dpct::dp4a(s2, u0.z(), s);
+                        s                     = dpct::dp4a(s3, u0.w(), s);
+                        s                     = dpct::dp4a(s4, u1.x(), s);
+                        s                     = dpct::dp4a(s5, u1.y(), s);
+                        s                     = dpct::dp4a(s6, u1.z(), s);
+                        s                     = dpct::dp4a(s7, u1.w(), s);
+                        const sycl::half2 * ads = reinterpret_cast<const sycl::half2 *>(mvy[m] + ncols) + 4 * p;
+                        const sycl::float2  ds  = ads[hb].convert<float, sycl::rounding_mode::automatic>();
+                        psum[m] += d * (s * ds.x() - ds.y());   // (q - 1) * a = q * a - a
+                    }
+                }
+            }
+#pragma unroll
+            for (int m = 0; m < Q2V2_SHARED_MAX_TOKENS; ++m) {
+                sum[m] += psum[m];
+            }
+        }
+    }
+
+    // every lane of a serving work-group takes part in the shuffles
+#pragma unroll
+    for (int m = 0; m < Q2V2_SHARED_MAX_TOKENS; ++m) {
+        if (mok[m]) {
+            float v = sum[m];
+#pragma unroll
+            for (int mask = LPR / 2; mask > 0; mask >>= 1) {
+                v += dpct::permute_sub_group_by_xor(sg, v, mask);
+            }
+            if (l == 0 && row < nrows) {
+                mdst[m][row] = v;
+            }
+        }
+    }
+}
+
+template <int LPR>
+static void launch_mul_mat_vec_q2v2_moe_shared(const void * vx_base, const void * vy, const int32_t * ids_dev,
+                                               float * dst_base, const int ncols, const int nrows,
+                                               const int n_tokens, const int n_used, const size_t ids_stride_e,
+                                               const size_t ids_stride_t, const size_t expert_weight_stride,
+                                               const size_t dst_stride_e, const size_t dst_stride_t,
+                                               const size_t vy_stride_e, const size_t vy_stride_t,
+                                               dpct::queue_ptr stream) {
+    constexpr int        NSG    = 4;   // sub-groups per work-group
+    constexpr int        RPS    = WARP_SIZE / LPR;
+    const int            groups = (nrows + RPS * NSG - 1) / (RPS * NSG);
+    const sycl::range<3> block_nums(1, (unsigned) (n_tokens * n_used), (unsigned) groups);
+    const sycl::range<3> block_dims(1, 1, NSG * WARP_SIZE);
+    stream->submit([&](sycl::handler & cgh) {
+        cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                         [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                             mul_mat_vec_q2v2_moe_shared<LPR>(vx_base, vy, dst_base, ids_dev, ncols, nrows, n_tokens,
+                                                              n_used, ids_stride_e, ids_stride_t,
+                                                              expert_weight_stride, dst_stride_e, dst_stride_t,
+                                                              vy_stride_e, vy_stride_t, it);
+                         });
+    });
+}
+
+// vy: the src1 rows of all tokens quantized with quantize_and_reorder_q8_1_soa, token t / slot e at
+// t * vy_stride_t + e * vy_stride_e. Caller checks as for ggml_sycl_mul_mat_vec_q2_0_fast_id and
+// 2 <= n_tokens <= Q2V2_SHARED_MAX_TOKENS.
+void ggml_sycl_mul_mat_vec_q2_0_shared_id(const void * vx_base, const void * vy, const int32_t * ids_dev,
+                                          float * dst_base, int ncols, int nrows, int n_tokens, int n_used,
+                                          size_t ids_stride_e, size_t ids_stride_t, size_t expert_weight_stride,
+                                          size_t dst_stride_e, size_t dst_stride_t, size_t vy_stride_e,
+                                          size_t vy_stride_t, dpct::queue_ptr stream) {
+    GGML_ASSERT(n_tokens >= 1 && n_tokens <= Q2V2_SHARED_MAX_TOKENS);
+    const int ppr = ncols / QK2_0 / 2;
+    int       lpr = 1;
+    while (lpr * 2 <= WARP_SIZE && ppr % (lpr * 2) == 0 && ppr / (lpr * 2) >= 2) {
+        lpr *= 2;
+    }
+#define Q2V2S(L) launch_mul_mat_vec_q2v2_moe_shared<L>(vx_base, vy, ids_dev, dst_base, ncols, nrows, n_tokens, \
+                                                      n_used, ids_stride_e, ids_stride_t, expert_weight_stride, \
+                                                      dst_stride_e, dst_stride_t, vy_stride_e, vy_stride_t, stream)
+    switch (lpr) {
+        case 1:  Q2V2S(1);  break;
+        case 2:  Q2V2S(2);  break;
+        case 4:  Q2V2S(4);  break;
+        case 8:  Q2V2S(8);  break;
+        case 16: Q2V2S(16); break;
+        default: Q2V2S(WARP_SIZE); break;
+    }
+#undef Q2V2S
+}

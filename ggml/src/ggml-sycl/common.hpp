@@ -260,12 +260,21 @@ static inline bool ggml_sycl_xmx_supports_type(ggml_type type) {
 
 // the DPAS shapes and 2D block loads used by the XMX kernel are those of Xe2
 static inline bool ggml_sycl_xmx_supports_arch(gpu_arch arch) {
+    // GGML_SYCL_XMX_PTL=1: also Xe3 (Panther Lake / Wildcat Lake), which keeps the Xe2 DPAS shapes and 2D block loads
+    static const bool xe3 = getenv("GGML_SYCL_XMX_PTL") && atoi(getenv("GGML_SYCL_XMX_PTL")) != 0;
     return arch == gpu_arch::intel_gpu_bmg_g21 || arch == gpu_arch::intel_gpu_bmg_g31 ||
-           arch == gpu_arch::intel_gpu_lnl_m;
+           arch == gpu_arch::intel_gpu_lnl_m ||
+           (xe3 && (arch == gpu_arch::intel_gpu_ptl_h || arch == gpu_arch::intel_gpu_ptl_u ||
+                    arch == gpu_arch::intel_gpu_wcl));
 }
 
 // fewest columns for which the XMX kernel is faster than the other kernels
 static inline int ggml_sycl_xmx_min_cols(ggml_type type) {
+    // with GGML_SYCL_XMX_PTL one column stays on the ESIMD mat-vec, which is ~5 % faster there on Xe3
+    static const bool xe3 = getenv("GGML_SYCL_XMX_PTL") && atoi(getenv("GGML_SYCL_XMX_PTL")) != 0;
+    if (xe3) {
+        return 2;
+    }
     return type == GGML_TYPE_Q2_K || type == GGML_TYPE_Q3_K || type == GGML_TYPE_Q4_K ? 1 : 2;
 }
 

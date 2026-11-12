@@ -124,4 +124,12 @@ void ggml_sycl_mul_mat_vec_q2_0_fast_id(const void * vx_base, const void * vy, c
                                         size_t expert_weight_stride, size_t dst_row_stride,
                                         size_t src1_row_stride, dpct::queue_ptr stream);
 
+// Q2_0 expert kernel shared across tokens (GGML_SYCL_MMID_SHARED=1): see mmvq.cpp.
+bool ggml_sycl_mmid_shared_enabled();
+void ggml_sycl_mul_mat_vec_q2_0_shared_id(const void * vx_base, const void * vy, const int32_t * ids_dev,
+                                          float * dst_base, int ncols, int nrows, int n_tokens, int n_used,
+                                          size_t ids_stride_e, size_t ids_stride_t, size_t expert_weight_stride,
+                                          size_t dst_stride_e, size_t dst_stride_t, size_t vy_stride_e,
+                                          size_t vy_stride_t, dpct::queue_ptr stream);
+
 #endif // GGML_SYCL_MMVQ_HPP

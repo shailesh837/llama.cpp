@@ -12996,6 +12996,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 10240, bs, 2560, {1, 1}, {1, 1}));
         }
     }
+    // MTP verify (1-8 rows) on the dense decode shapes: attn_qkv/q/gate [2560 -> 10240/12288/6144],
+    // ssm_out/attn_output [6144 -> 2560], output head [2560 -> 248320]
+    for (ggml_type t : {GGML_TYPE_Q3_K, GGML_TYPE_IQ4_XS, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0}) {
+        for (int bs : {1, 2, 4, 6, 8}) {
+            for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{{10240, 2560}, {6144, 2560}, {2560, 6144}}) {
+                test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, m, bs, k, {1, 1}, {1, 1}));
+            }
+            if (t == GGML_TYPE_Q5_K) {
+                test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 248320, bs, 2560, {1, 1}, {1, 1}));
+            }
+        }
+    }
 
     return test_cases;
 }

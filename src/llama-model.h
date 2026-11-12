@@ -744,6 +744,10 @@ struct llama_model {
     struct ggml_tensor * output_s    = nullptr;
     struct ggml_tensor * output_in_s = nullptr;
 
+    // LLAMA_MTP_SHORTLIST: rows of `output` for a draft vocabulary shortlist and their token ids (MTP drafter only)
+    struct ggml_tensor * output_short     = nullptr;
+    struct ggml_tensor * output_short_ids = nullptr;
+
     // NextN/MTP model-level projections
     struct ggml_tensor * nextn_proj_pre  = nullptr;
     struct ggml_tensor * nextn_proj_post = nullptr;
@@ -966,6 +970,9 @@ struct llama_model_base : public llama_model {
 
     // helper: make the prism.hadamard rotation and sign tensors for the folded weights
     void load_tensors_hadamard();
+
+    // helper: LLAMA_MTP_SHORTLIST=<file of token ids>: copy those rows of the output head of an MTP drafter
+    void load_tensors_shortlist();
 
     // helper: read the SWA pattern as one flag per layer, or as a period expanded by set_swa_pattern
     void load_swa_pattern(llama_model_loader & ml, uint32_t n_pattern, bool dense_first = false);

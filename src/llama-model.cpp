@@ -2052,8 +2052,96 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     load_tensors_hadamard();
+    load_tensors_shortlist();
 
     return true;
+}
+
+// LLAMA_MTP_SHORTLIST=<file>: an MTP drafter computes logits only for the token ids listed in the file (one per line);
+// the graph writes them into a full-vocabulary row whose other entries are -inf. The target model verifies every
+// drafted token, so the output does not change; a token outside the list only ends a draft early.
+void llama_model_base::load_tensors_shortlist() {
+    const char * path = getenv("LLAMA_MTP_SHORTLIST");
+    if (!path || !*path || !output || output_s || d2t || hparams.n_layer_nextn == 0) {
+        return;
+    }
+    bool has_nextn = false;
+    for (const auto & layer : layers) {
+        has_nextn = has_nextn || layer.nextn.eh_proj != nullptr;
+    }
+    if (!has_nextn || output->buffer == nullptr || !ggml_is_contiguous(output) || output->ne[2] != 1) {
+        return;
+    }
+
+    const int64_t n_vocab = output->ne[1];
+    std::vector<int32_t> ids;
+    {
+        FILE * f = fopen(path, "r");
+        if (!f) {
+            throw std::runtime_error(format("LLAMA_MTP_SHORTLIST: cannot open %s", path));
+        }
+        long v;
+        while (fscanf(f, "%ld", &v) == 1) {
+            if (v >= 0 && v < n_vocab) {
+                ids.push_back((int32_t) v);
+            }
+        }
+        fclose(f);
+    }
+    std::sort(ids.begin(), ids.end());
+    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+    if (ids.empty() || (int64_t) ids.size() >= n_vocab) {
+        return;
+    }
+    const int64_t n_short = (int64_t) ids.size();
+
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(output->buffer);
+    if (ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft)) {
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            buft = ggml_backend_dev_buffer_type(dev);
+        }
+    }
+
+    ggml_init_params params = {
+        /*.mem_size   =*/ 2 * ggml_tensor_overhead(),
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx { ggml_init(params) };
+    if (!ctx) {
+        throw std::runtime_error("LLAMA_MTP_SHORTLIST: failed to create context");
+    }
+    ggml_tensor * w   = ggml_new_tensor_2d(ctx.get(), output->type, output->ne[0], n_short);
+    ggml_tensor * idx = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, n_short);
+    ggml_set_name(w,   "output_short.weight");
+    ggml_set_name(idx, "output_short.ids");
+
+    ggml_backend_buffer_ptr buffer { ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft) };
+    if (!buffer) {
+        throw std::runtime_error(format("LLAMA_MTP_SHORTLIST: unable to allocate %s buffer", ggml_backend_buft_name(buft)));
+    }
+    ggml_backend_buffer_set_usage(buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    // the weights are read back before any graph ran, so they are still in the file layout
+    const size_t row_size = ggml_row_size(output->type, output->ne[0]);
+    std::vector<uint8_t> full(ggml_nbytes(output));
+    ggml_backend_tensor_get(output, full.data(), 0, full.size());
+    std::vector<uint8_t> rows((size_t) n_short * row_size);
+    for (int64_t i = 0; i < n_short; ++i) {
+        memcpy(rows.data() + (size_t) i * row_size, full.data() + (size_t) ids[i] * row_size, row_size);
+    }
+    ggml_backend_tensor_set(w, rows.data(), 0, rows.size());
+    ggml_backend_tensor_set(idx, ids.data(), 0, ids.size() * sizeof(int32_t));
+
+    output_short     = w;
+    output_short_ids = idx;
+
+    std::vector<ggml_backend_buffer_ptr> buffers;
+    buffers.emplace_back(std::move(buffer));
+    pimpl->ctxs_bufs.emplace_back(std::move(ctx), std::move(buffers));
+
+    LLAMA_LOG_INFO("%s: MTP draft vocabulary shortlist: %lld of %lld tokens (%.1f MiB instead of %.1f MiB)\n", __func__,
+                   (long long) n_short, (long long) n_vocab, rows.size() / 1048576.0, full.size() / 1048576.0);
 }
 
 // read and check the prism.hadamard metadata, and record the folded weights (load_tensors_hadamard makes the tensors)
