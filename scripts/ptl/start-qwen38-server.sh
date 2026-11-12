@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Qwen3.8-Flash-Next Q2_0 + MTP on Intel Panther Lake (Arc B390 iGPU), llama.cpp SYCL.
-# Verified setup: 41.1 tok/s decode over Agents4PLC (strict pass 67.5 %), prefill ~225 tok/s at 34k context.
+# Verified setup: 41.1 tok/s decode over Agents4PLC (strict pass 67.5 %) before UR_L0_USE_DRIVER_INORDER_LISTS (+14 %), prefill ~225 tok/s at 34k context.
 # No root needed.
 #
 # THINK=1 (default): thinking on, reasoning effort medium, --reasoning-preserve (agent use, e.g. opencode).
@@ -64,6 +64,9 @@ if [ "$NEW" = 1 ]; then
     # GGML_SYCL_MMID_SHARED=1        Q2_0 experts of all MTP verify rows in one launch, a repeated expert read once
     # GGML_SYCL_TINY_FUSE=7          merged tiny kernels (unary chains, add runs, copy runs)
     # LLAMA_QWEN4EXP_CONV_STATE_NOCONT=1   one copy less per recurrent-state slot
+    # UR_L0_USE_DRIVER_INORDER_LISTS=1   the Level Zero driver keeps kernel order instead of the adapter (~5 us
+    #                                    per launch, ~2,600 launches per step); L0IO=0 turns it off
+    if [ "${L0IO:-1}" = 1 ]; then export UR_L0_USE_DRIVER_INORDER_LISTS=1; fi
     if [ "${KERN:-1}" = 1 ]; then
         export GGML_SYCL_MMID_SHARED=1 GGML_SYCL_TINY_FUSE=7 LLAMA_QWEN4EXP_CONV_STATE_NOCONT=1
     fi

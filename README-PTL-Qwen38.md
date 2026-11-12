@@ -15,7 +15,9 @@ Decode (generation) speed as reported by the server.
 | 11 Nov: + MTP drafter vocabulary shortlist | 34.5 over Agents4PLC | 66.7 % (67.5 %) |
 | **12 Nov: + shared-expert verify kernel, tiny-kernel fusion, n-gram + probabilistic drafts (start script default)** | **41.1 over Agents4PLC** | **67.5 % (68.4 %)** |
 
-Agent-style requests (opencode-like CODESYS prompts, thinking on, reasoning effort medium, temperature 1.0): 25.4 tok/s with the 8 Nov setup, 28.5 with the 11 Nov parts, 35.0 with the 12 Nov parts.
+Agent-style requests (opencode-like CODESYS prompts, thinking on, reasoning effort medium, temperature 1.0): 25.4 tok/s with the 8 Nov setup, 28.5 with the 11 Nov parts, 35.0 with the 12 Nov parts, **40.0 with `UR_L0_USE_DRIVER_INORDER_LISTS=1`** (start script default; Agents4PLC not yet rerun with it).
+
+Six test requests of the NUC A/B script (thinking off), 8 Nov setup -> all parts -> + in-order lists: 28.2 -> 39.6 -> 45.6 tok/s (file rewrite 64.5).
 
 Accuracy differences of 1-2 tasks are within run-to-run variation (5 tasks better, 3 worse than upstream in the 8 Nov run); the output text is not deterministic between runs even at temperature 0.
 
@@ -159,6 +161,7 @@ export GGML_SYCL_XMX_Q2_0=1 GGML_SYCL_DYNAMIC_PRECISION=BF16 GGML_SYCL_DNNL_FPMA
 export GGML_SYCL_SPARSE_FA=1 GGML_SYCL_SPARSE_FA_ROWS=8 GGML_SYCL_FA_SKIP_MASKED=1
 export GGML_SYCL_XMX_PTL=1 LLAMA_MTP_SHORTLIST=scripts/ptl/mtp-shortlist-plc-96k.txt
 export GGML_SYCL_MMID_SHARED=1 GGML_SYCL_TINY_FUSE=7 LLAMA_QWEN4EXP_CONV_STATE_NOCONT=1
+export UR_L0_USE_DRIVER_INORDER_LISTS=1
 taskset -c 0-3 build/bin/llama-server \
     -m ~/models/Q2_0_hcq8/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf \
     -lm dio -lzm on -ngl 99 -fa on --jinja --reasoning on --reasoning-preserve --reasoning-effort medium \
@@ -180,6 +183,7 @@ Notes:
 - Thinking: the start script runs with thinking on and `--reasoning-effort medium` (`THINK=0` turns thinking off). The Qwen3.8 chat template defaults to `xhigh`; in an opencode benchmark on pick & place CODESYS tasks, medium gave better results than xhigh. Thinking text decodes slower than code (lower draft acceptance), so agent turns run at ~35 tok/s rather than the 41 of Agents4PLC (no thinking, temperature 0). Use the sampling defaults of the model (temperature 1.0, top-k 20, top-p 0.95, in the GGUF).
 - `-cram 0` turns off the host-RAM prompt cache, which grew 120-230 MB per request until 8 GB and pushed the machine into swap with `-c 65536`. SYCL graphs (`GGML_SYCL_ENABLE_GRAPH`) stay off: with MTP no graph is replayed and the graph cache grows ~110 MB per request.
 - Drafts: n-gram drafts of 3-7 tokens (text the model re-emits, e.g. a file rewrite) go before the MTP drafts, and MTP drafts are sampled (`probabilistic`). Keep the n-gram `n-max` at 7 or less: a verify of more than 8 rows leaves the 8-row fast paths (small-batch experts, 8-column mat-vec, sparse attention rows) and gets much slower. In the start script `SPEC=0` goes back to MTP only with greedy drafts, `KERN=0` turns off the three 12 Nov kernel switches.
+- `UR_L0_USE_DRIVER_INORDER_LISTS=1` (a oneAPI Unified Runtime setting, no code change): the Level Zero driver keeps the kernels of the in-order queue in order itself instead of the adapter tracking every launch. A decode step has ~2,600 small kernels, and the adapter's bookkeeping cost ~5 us each: 13 ms less per MTP step, +14 % decode. The newer adapter (`UR_LOADER_USE_LEVEL_ZERO_V2=1`) gave the same speed; the script keeps the adapter all other measurements used. `L0IO=0` turns it off.
 - Run only one GPU job (server, benchmark, test) at a time.
 
 ## 5. Check correctness (optional)
