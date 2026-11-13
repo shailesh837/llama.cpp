@@ -7226,6 +7226,8 @@ struct ggml_sycl_prof_node {
 //   2  runs of ADD over equally shaped F32 tensors (the sum of the routed experts' outputs)
 //   4  runs of CPY with one strided layout (the rollback slots of a conv state; needs
 //      LLAMA_QWEN4EXP_CONV_STATE_NOCONT=1, which removes the CONT in front of each CPY)
+//   8  leaner kernels for the conv state: the CPY run of bit 4 and CONCAT along dim 0 take one
+//      work-item per element with 32-bit offsets (no 64-bit division, no idle work-items)
 // Each element is computed with the expressions of the separate kernels, in the same order.
 // A run is left to the normal path whenever a shape, a type or the memory layout does not fit.
 static int ggml_sycl_tiny_fuse_mask() {
@@ -7482,6 +7484,16 @@ static int ggml_sycl_tiny_fuse_cpy_run(ggml_backend_sycl_context & ctx, const gg
     const int64_t s0 = (int64_t) (s->nb[0] / sizeof(float)), s1 = (int64_t) (s->nb[1] / sizeof(float)),
                   s2 = (int64_t) (s->nb[2] / sizeof(float)), s3 = (int64_t) (s->nb[3] / sizeof(float));
     const int64_t n_el = ggml_nelements(s);
+    // GGML_SYCL_TINY_FUSE & 8: two-dimensional sources take their row and column from the range, so
+    // the kernel has no 64-bit division per element (the conv-state copies of Qwen3.8: 38 us each)
+    if ((ggml_sycl_tiny_fuse_mask() & 8) && s->ne[2] == 1 && s->ne[3] == 1 && s0 * ne0 + s1 * ne1 <= INT32_MAX) {
+        const int e0 = (int) ne0, t0 = (int) s0, t1 = (int) s1;
+        ctx.stream()->parallel_for(sycl::range<3>((size_t) n, (size_t) ne1, (size_t) ne0), [=](sycl::id<3> id) {
+            const int i1 = (int) id[1], i0 = (int) id[2];
+            dp[id[0]][i1 * e0 + i0] = sp[id[0]][i0 * t0 + i1 * t1];
+        });
+        return last_idx - i;
+    }
     ctx.stream()->parallel_for(sycl::range<2>((size_t) n, (size_t) n_el), [=](sycl::id<2> id) {
         const int64_t e  = (int64_t) id[1];
         const int64_t i0 = e % ne0;
@@ -7495,7 +7507,231 @@ static int ggml_sycl_tiny_fuse_cpy_run(ggml_backend_sycl_context & ctx, const gg
     return last_idx - i;
 }
 
+// ---- GGML_SYCL_GDN_STATE_DIRECT (local-speedup): gated_delta_net reads its state from the cache ----
+// The graph gathers a layer's current recurrent state with GET_ROWS (one 3 MB row per sequence for
+// Qwen3.8) and hands the copy to GATED_DELTA_NET. The kernel loads its state into registers before
+// it writes anything, so it can read the cache row itself and the copy can go.
+//   =1  skip the GET_ROWS, the kernel indexes the cache with the row ids
+//   =2  self-check: keep the gather and compare it with the cache rows right before the kernel
+// A GET_ROWS is taken only if its single reader is the state input of a GATED_DELTA_NET that
+// follows it and no node between the two writes into the gathered tensor.
+static int ggml_sycl_gdn_state_direct_mode() {
+    static const int mode = getenv("GGML_SYCL_GDN_STATE_DIRECT") ? atoi(getenv("GGML_SYCL_GDN_STATE_DIRECT")) : 0;
+    return mode;
+}
+
+struct ggml_sycl_gdn_direct_plan {
+    const ggml_tensor * first = nullptr;   // identity of the graph the plan was made for
+    const ggml_tensor * mid   = nullptr;
+    const ggml_tensor * last  = nullptr;
+    int                 n_nodes = 0;
+    std::vector<int>    gdn_of;    // per node: the GATED_DELTA_NET that reads this GET_ROWS directly, or -1
+    std::vector<int>    rows_of;   // per node: the GET_ROWS this GATED_DELTA_NET reads directly, or -1
+    int                 n_pairs = 0;
+};
+
+static const ggml_tensor * ggml_sycl_view_root(const ggml_tensor * t) {
+    while ((t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE) &&
+           t->src[0] != nullptr) {
+        t = t->src[0];
+    }
+    return t;
+}
+
+static bool ggml_sycl_gdn_direct_candidate(const ggml_tensor * n) {
+    if (n->op != GGML_OP_GET_ROWS || n->type != GGML_TYPE_F32 || (n->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+        (n->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+        return false;
+    }
+    const ggml_tensor * cache = n->src[0];
+    const ggml_tensor * ids   = n->src[1];
+    return cache != nullptr && ids != nullptr && cache->type == GGML_TYPE_F32 && cache->data != nullptr &&
+           cache->ne[2] == 1 && cache->ne[3] == 1 && ggml_is_contiguous(cache) &&
+           ids->type == GGML_TYPE_I32 && ids->data != nullptr && ggml_is_contiguous(ids) &&
+           n->ne[0] == cache->ne[0] && ggml_nelements(n) == cache->ne[0] * ggml_nelements(ids) &&
+           cache->nb[1] >= 256 * 1024;   // only rows worth it
+}
+
+static void ggml_sycl_gdn_direct_build(const ggml_cgraph * cgraph, ggml_sycl_gdn_direct_plan & plan) {
+    const int n_nodes = cgraph->n_nodes;
+    plan.first   = cgraph->nodes[0];
+    plan.mid     = cgraph->nodes[n_nodes / 2];
+    plan.last    = cgraph->nodes[n_nodes - 1];
+    plan.n_nodes = n_nodes;
+    plan.n_pairs = 0;
+    plan.gdn_of.assign(n_nodes, -1);
+    plan.rows_of.assign(n_nodes, -1);
+
+    static const bool dbg = getenv("GGML_SYCL_GDN_STATE_DIRECT_DEBUG") != nullptr;
+    int n_dbg = 0;
+    std::vector<std::pair<const ggml_tensor *, int>> cand;   // GET_ROWS node, index
+    for (int i = 0; i < n_nodes; i++) {
+        if (ggml_sycl_gdn_direct_candidate(cgraph->nodes[i])) {
+            cand.emplace_back(cgraph->nodes[i], i);
+        }
+    }
+    if (cand.empty() && !dbg) {
+        return;
+    }
+    std::sort(cand.begin(), cand.end());
+    const auto find = [&](const ggml_tensor * t) -> int {
+        const auto it = std::lower_bound(cand.begin(), cand.end(), std::make_pair(t, -1));
+        return it != cand.end() && it->first == t ? it->second : -1;
+    };
+    std::vector<char> bad(n_nodes, 0);
+    // every reader of a candidate, directly or through views, must be the one kernel that takes it
+    for (int j = 0; j < n_nodes; j++) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        const bool pure_view = n->op == GGML_OP_RESHAPE || n->op == GGML_OP_VIEW || n->op == GGML_OP_PERMUTE ||
+                               n->op == GGML_OP_TRANSPOSE;
+        // nodes the compute loop never runs read nothing (build_rs adds a zero-size copy of every gather)
+        if (!pure_view && (ggml_is_empty(n) || n->op == GGML_OP_NONE || (n->flags & GGML_TENSOR_FLAG_COMPUTE) == 0)) {
+            continue;
+        }
+        for (int s = 0; s < GGML_MAX_SRC; s++) {
+            const ggml_tensor * src = n->src[s];
+            if (src == nullptr) {
+                continue;
+            }
+            const ggml_tensor * root = ggml_sycl_view_root(src);
+            if (root->op != GGML_OP_GET_ROWS) {
+                continue;
+            }
+            const int c = find(root);
+            if (c < 0) {
+                continue;
+            }
+            if (pure_view) {
+                if (n->flags & GGML_TENSOR_FLAG_OUTPUT) {
+                    bad[c] = 1;
+                }
+                continue;
+            }
+            const ggml_tensor * rows = cgraph->nodes[c];
+            const bool ok = n->op == GGML_OP_GATED_DELTA_NET && s == 5 && j > c && plan.gdn_of[c] < 0 &&
+                            n->type == GGML_TYPE_F32 && n->src[2] != nullptr && src->data == rows->data &&
+                            ggml_is_contiguous(src) && ggml_nelements(src) == ggml_nelements(rows) &&
+                            n->src[2]->ne[3] == ggml_nelements(rows->src[1]) &&
+                            rows->ne[0] == n->src[2]->ne[0] * n->src[2]->ne[0] * n->src[2]->ne[1];
+            if (ok) {
+                plan.gdn_of[c] = j;
+            } else {
+                if (dbg && !bad[c] && n_dbg++ < 6) {
+                    fprintf(stderr, "[SYCL-GDN-DIRECT] reject gather %d (%s): reader %d %s (%s) src %d, gdn_of %d, data %d, contig %d, nel %lld/%lld\n",
+                            c, rows->name, j, ggml_op_name(n->op), n->name, s, plan.gdn_of[c], (int) (src->data == rows->data),
+                            (int) ggml_is_contiguous(src), (long long) ggml_nelements(src), (long long) ggml_nelements(rows));
+                }
+                bad[c] = 1;
+            }
+        }
+    }
+    if (dbg) {
+        int n_gdn = 0;
+        for (int j = 0; j < n_nodes; j++) {
+            const ggml_tensor * n = cgraph->nodes[j];
+            if (n->op == GGML_OP_GATED_DELTA_NET && n_gdn++ < 2 && n->src[5] != nullptr) {
+                const ggml_tensor * r = ggml_sycl_view_root(n->src[5]);
+                fprintf(stderr, "[SYCL-GDN-DIRECT] gdn %d (%s): state src op %s (%s), root op %s (%s) ne [%lld,%lld,%lld,%lld], root src0 %s ne [%lld,%lld] nb1 %zu extra %d type %d\n",
+                        j, n->name, ggml_op_name(n->src[5]->op), n->src[5]->name, ggml_op_name(r->op), r->name,
+                        (long long) r->ne[0], (long long) r->ne[1], (long long) r->ne[2], (long long) r->ne[3],
+                        r->src[0] ? r->src[0]->name : "-", r->src[0] ? (long long) r->src[0]->ne[0] : 0,
+                        r->src[0] ? (long long) r->src[0]->ne[1] : 0, r->src[0] ? r->src[0]->nb[1] : (size_t) 0,
+                        r->src[0] ? (int) (r->src[0]->extra != nullptr) : -1, r->src[0] ? (int) r->src[0]->type : -1);
+            }
+        }
+        fprintf(stderr, "[SYCL-GDN-DIRECT] graph nodes=%d: %zu candidate gathers, %d gated_delta_net nodes\n", n_nodes, cand.size(), n_gdn);
+    }
+    for (const auto & cd : cand) {
+        const int c = cd.second;
+        const int g = plan.gdn_of[c];
+        if (g < 0 || bad[c]) {
+            plan.gdn_of[c] = -1;
+            continue;
+        }
+        // nothing between the gather and the kernel may write into the cache
+        const ggml_tensor * cache = cgraph->nodes[c]->src[0];
+        const char *        c0    = (const char *) cache->data;
+        const char *        c1    = c0 + ggml_nbytes(cache);
+        bool                clean = true;
+        for (int j = c + 1; j < g && clean; j++) {
+            const ggml_tensor * n = cgraph->nodes[j];
+            if (n->op == GGML_OP_RESHAPE || n->op == GGML_OP_VIEW || n->op == GGML_OP_PERMUTE ||
+                n->op == GGML_OP_TRANSPOSE || n->op == GGML_OP_NONE || n->data == nullptr || ggml_is_empty(n) ||
+                (n->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                continue;
+            }
+            const char * n0 = (const char *) n->data;
+            const char * n1 = n0 + ggml_nbytes(n);
+            clean = n1 <= c0 || n0 >= c1;
+        }
+        if (!clean) {
+            plan.gdn_of[c] = -1;
+            continue;
+        }
+        plan.rows_of[g] = c;
+        plan.n_pairs++;
+    }
+}
+
+// the plan of this graph; graphs are reused between steps, so a few plans are kept by graph identity
+static const ggml_sycl_gdn_direct_plan * ggml_sycl_gdn_direct_get(const ggml_cgraph * cgraph) {
+    if (ggml_sycl_gdn_state_direct_mode() == 0 || cgraph->n_nodes < 8) {
+        return nullptr;
+    }
+    static std::vector<ggml_sycl_gdn_direct_plan> plans(16);
+    static size_t next = 0;
+    static uint64_t built = 0;
+    const int n_nodes = cgraph->n_nodes;
+    for (const auto & p : plans) {
+        if (p.n_nodes == n_nodes && p.first == cgraph->nodes[0] && p.mid == cgraph->nodes[n_nodes / 2] &&
+            p.last == cgraph->nodes[n_nodes - 1]) {
+            return p.n_pairs > 0 ? &p : nullptr;
+        }
+    }
+    ggml_sycl_gdn_direct_plan & p = plans[next];
+    next = (next + 1) % plans.size();
+    ggml_sycl_gdn_direct_build(cgraph, p);
+    built++;
+    if (built <= 8 || (built & (built - 1)) == 0) {
+        fprintf(stderr, "[SYCL-GDN-DIRECT] plan %llu: graph nodes=%d, %d state gathers read directly\n",
+                (unsigned long long) built, n_nodes, p.n_pairs);
+    }
+    return p.n_pairs > 0 ? &p : nullptr;
+}
+
+// =2: the gathered copy must equal the cache rows at the time the kernel runs
+static void ggml_sycl_gdn_direct_check(ggml_backend_sycl_context & ctx, const ggml_tensor * rows) {
+    static uint64_t checked = 0, differ = 0;
+    const ggml_tensor * cache = rows->src[0];
+    const ggml_tensor * ids   = rows->src[1];
+    const int64_t       n_ids = ggml_nelements(ids);
+    const size_t        row   = cache->nb[1];
+    dpct::queue_ptr     q     = ctx.stream();
+    q->wait();
+    std::vector<int32_t> idv(n_ids);
+    q->memcpy(idv.data(), ids->data, n_ids * sizeof(int32_t)).wait();
+    std::vector<char> a(row), b(row);
+    for (int64_t s = 0; s < n_ids; s++) {
+        q->memcpy(a.data(), (const char *) rows->data + s * row, row).wait();
+        q->memcpy(b.data(), (const char *) cache->data + (size_t) idv[s] * row, row).wait();
+        checked++;
+        if (memcmp(a.data(), b.data(), row) != 0) {
+            differ++;
+            if (differ <= 10) {
+                fprintf(stderr, "[SYCL-GDN-DIRECT] MISMATCH: %s row %d of %lld differs from its gathered copy\n", rows->name,
+                        (int) idv[s], (long long) cache->ne[1]);
+            }
+        }
+    }
+    if ((checked & (checked - 1)) == 0 || checked % 3600 == 0) {
+        fprintf(stderr, "[SYCL-GDN-DIRECT] check: %llu state rows compared, %llu differ\n", (unsigned long long) checked,
+                (unsigned long long) differ);
+    }
+}
+
 static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
+    const ggml_sycl_gdn_direct_plan * gdn_direct      = ggml_sycl_gdn_direct_get(cgraph);
+    const int                         gdn_direct_mode = ggml_sycl_gdn_state_direct_mode();
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
         if (ggml_sycl_is_view_or_noop(node)) {
@@ -7503,6 +7739,9 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         }
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
             continue;
+        }
+        if (gdn_direct != nullptr && gdn_direct_mode == 1 && gdn_direct->gdn_of[i] >= 0) {
+            continue;   // GGML_SYCL_GDN_STATE_DIRECT: the gated_delta_net reads this state row from the cache
         }
         ggml_sycl_prof_node prof_node(tl_ggml_sycl_prof_cur, sycl_ctx, node);
 
@@ -7535,11 +7774,27 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
 #endif
         // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
         if (node->op == GGML_OP_GATED_DELTA_NET) {
+            ggml_sycl_gated_delta_net_direct_state         direct_state;
+            const ggml_sycl_gated_delta_net_direct_state * direct = nullptr;
+            if (gdn_direct != nullptr && gdn_direct->rows_of[i] >= 0) {
+                const ggml_tensor * rows = cgraph->nodes[gdn_direct->rows_of[i]];
+                if (gdn_direct_mode == 1) {
+                    direct_state = { (const float *) rows->src[0]->data, (const int32_t *) rows->src[1]->data,
+                                     (int64_t) (rows->src[0]->nb[1] / sizeof(float)) };
+                    direct       = &direct_state;
+                } else {
+                    ggml_sycl_gdn_direct_check(*sycl_ctx, rows);
+                }
+            }
             ggml_sycl_gated_delta_net_fused_cache fused_state_cpy;
             const int gdn_nodes_to_skip = ggml_sycl_try_gdn_cache_fusion(cgraph, i, fused_state_cpy);
             if (gdn_nodes_to_skip > 0) {
-                ggml_sycl_op_gated_delta_net_fused_cache(*sycl_ctx, node, fused_state_cpy);
+                ggml_sycl_op_gated_delta_net_ex(*sycl_ctx, node, &fused_state_cpy, direct);
                 i += gdn_nodes_to_skip;
+                continue;
+            }
+            if (direct != nullptr) {
+                ggml_sycl_op_gated_delta_net_ex(*sycl_ctx, node, nullptr, direct);
                 continue;
             }
         }

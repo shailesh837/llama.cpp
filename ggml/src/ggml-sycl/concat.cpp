@@ -169,6 +169,32 @@ void concat_impl_sycl(ggml_backend_sycl_context & ctx, ggml_tensor *dst) {
 
     const int32_t dim = ((int32_t *) dst->op_params)[0];
 
+    // GGML_SYCL_TINY_FUSE & 8 (local-speedup): dim 0 of two-dimensional tensors with one work-item per
+    // destination element and 32-bit offsets. The conv state of Qwen3.8 is [3,10240] + a transposed
+    // [1,10240]; the general kernel below runs 16 or more work-items per 4 elements and takes 41 us.
+    static const bool lean = getenv("GGML_SYCL_TINY_FUSE") != nullptr && (atoi(getenv("GGML_SYCL_TINY_FUSE")) & 8) != 0;
+    const auto strides_ok = [](const ggml_tensor * t) {
+        return t->nb[0] % sizeof(T) == 0 && t->nb[1] % sizeof(T) == 0 &&
+               ((t->ne[0] - 1) * t->nb[0] + (t->ne[1] - 1) * t->nb[1]) / sizeof(T) < (size_t) INT32_MAX;
+    };
+    if (lean && dim == 0 && dst->ne[2] == 1 && dst->ne[3] == 1 && src0->ne[2] == 1 && src0->ne[3] == 1 &&
+        src1->ne[2] == 1 && src1->ne[3] == 1 && ggml_is_contiguous(dst) && src0->ne[1] == dst->ne[1] &&
+        src1->ne[1] == dst->ne[1] && src0->ne[0] + src1->ne[0] == dst->ne[0] && strides_ok(src0) && strides_ok(src1) &&
+        ggml_nelements(dst) < INT32_MAX) {
+        const T * x    = (const T *) src0->data;
+        const T * y    = (const T *) src1->data;
+        T *       d    = (T *) dst->data;
+        const int ne0  = (int) dst->ne[0];
+        const int ne00 = (int) src0->ne[0];
+        const int a0   = (int) (src0->nb[0] / sizeof(T)), a1 = (int) (src0->nb[1] / sizeof(T));
+        const int b0   = (int) (src1->nb[0] / sizeof(T)), b1 = (int) (src1->nb[1] / sizeof(T));
+        stream->parallel_for(sycl::range<2>((size_t) dst->ne[1], (size_t) ne0), [=](sycl::id<2> id) {
+            const int i1 = (int) id[0], i0 = (int) id[1];
+            d[i1 * ne0 + i0] = i0 < ne00 ? x[i0 * a0 + i1 * a1] : y[(i0 - ne00) * b0 + i1 * b1];
+        });
+        return;
+    }
+
     if (ggml_is_contiguous(src0) && ggml_is_contiguous(src1)) {
         const T * src0_d = (const T *) src0->data;
         const T * src1_d = (const T *) src1->data;

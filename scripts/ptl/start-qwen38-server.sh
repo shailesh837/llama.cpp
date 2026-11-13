@@ -62,13 +62,14 @@ if [ "$NEW" = 1 ]; then
     export LLAMA_MTP_SHORTLIST=${SHORTLIST:-$ROOT/scripts/ptl/mtp-shortlist-plc-96k.txt}
     # 12 Nov (KERN=0 turns these off):
     # GGML_SYCL_MMID_SHARED=1        Q2_0 experts of all MTP verify rows in one launch, a repeated expert read once
-    # GGML_SYCL_TINY_FUSE=7          merged tiny kernels (unary chains, add runs, copy runs)
+    # GGML_SYCL_TINY_FUSE=15         merged tiny kernels (unary chains, add runs, copy runs) + leaner conv-state concat/copy
+    # GGML_SYCL_GDN_STATE_DIRECT=1   the recurrent-state kernel reads the state cache in place (no 3 MB gather per layer)
     # LLAMA_QWEN4EXP_CONV_STATE_NOCONT=1   one copy less per recurrent-state slot
     # UR_L0_USE_DRIVER_INORDER_LISTS=1   the Level Zero driver keeps kernel order instead of the adapter (~5 us
     #                                    per launch, ~2,600 launches per step); L0IO=0 turns it off
     if [ "${L0IO:-1}" = 1 ]; then export UR_L0_USE_DRIVER_INORDER_LISTS=1; fi
     if [ "${KERN:-1}" = 1 ]; then
-        export GGML_SYCL_MMID_SHARED=1 GGML_SYCL_TINY_FUSE=7 LLAMA_QWEN4EXP_CONV_STATE_NOCONT=1
+        export GGML_SYCL_MMID_SHARED=1 GGML_SYCL_TINY_FUSE=15 LLAMA_QWEN4EXP_CONV_STATE_NOCONT=1 GGML_SYCL_GDN_STATE_DIRECT=1
     fi
 fi
 # Drafts: MTP, 5 tokens, p-min 0.5. SPEC=1 (default): n-gram drafts of 3-7 tokens in front of MTP (re-emitted code)

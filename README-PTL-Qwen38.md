@@ -15,7 +15,7 @@ Decode (generation) speed as reported by the server.
 | 11 Nov: + MTP drafter vocabulary shortlist | 34.5 over Agents4PLC | 66.7 % (67.5 %) |
 | **12 Nov: + shared-expert verify kernel, tiny-kernel fusion, n-gram + probabilistic drafts (start script default)** | **41.1 over Agents4PLC** | **67.5 % (68.4 %)** |
 
-Agent-style requests (opencode-like CODESYS prompts, thinking on, reasoning effort medium, temperature 1.0): 25.4 tok/s with the 8 Nov setup, 28.5 with the 11 Nov parts, 35.0 with the 12 Nov parts, **40.0 with `UR_L0_USE_DRIVER_INORDER_LISTS=1`** (start script default; Agents4PLC not yet rerun with it).
+Agent-style requests (opencode-like CODESYS prompts, thinking on, reasoning effort medium, temperature 1.0): 25.4 tok/s with the 8 Nov setup, 28.5 with the 11 Nov parts, 35.0 with the 12 Nov parts, 40.0 with `UR_L0_USE_DRIVER_INORDER_LISTS=1`, **41.0 with the 13 Nov state-read and conv-state kernels** (start script default; Agents4PLC not yet rerun with it).
 
 Six test requests of the NUC A/B script (thinking off), 8 Nov setup -> all parts -> + in-order lists: 28.2 -> 39.6 -> 45.6 tok/s (file rewrite 64.5).
 
@@ -48,7 +48,8 @@ Every change is behind an environment variable and is off by default. Without th
 | `GGML_SYCL_XMX_PTL=1` | `ggml/src/ggml-sycl/common.hpp` | Decode with MTP: the existing XMX (DPAS) mat-vec for Q2_K..Q8_0 with 2..80 columns, so far enabled only for Xe2 (BMG, LNL), also runs on Xe3 (Panther Lake, Wildcat Lake). The MTP verify step (6 rows) of a dense K-quant weight then costs 1.05-1.16x one row instead of 1.3-3.6x (Q3_K 337 -> 113 us). One column stays on the ESIMD mat-vec. |
 | `LLAMA_MTP_SHORTLIST=<file>` | `src/llama-model.cpp`, `src/llama-model.h`, `src/models/qwen4exp.cpp` | The MTP drafter computes logits only for the token ids listed in the file: at load, the matching rows of its output head (Q4_0, 248k x 2560, 358 MB, ~3.2 ms per drafted token) are copied into a smaller matrix; the draft graph writes those logits into a full-vocabulary row whose other entries are -inf. Lossless: the target model verifies every drafted token, and a token outside the list only ends a draft early. `scripts/ptl/mtp-shortlist-plc-96k.txt` (98,304 tokens, 1.3 ms per draft) covers 99.9 % of the tokens of held-out Agents4PLC answers. A smaller list is faster but must cover the domain vocabulary: a 32k list without PLC words covered 95 % and lowered draft acceptance from 0.88 to 0.79. |
 | `GGML_SYCL_MMID_SHARED=1` | `ggml/src/ggml-sycl/mmvq.cpp`, `mmvq.hpp`, `ggml-sycl.cpp` | MTP verify of 2-8 rows: the Q2_0 experts of all rows in one launch instead of one quantize and one kernel launch per row; an expert picked by several rows is read and unpacked once (34 % of the experts of a 6-row verify are repeats). The repeats are found inside the kernel from the ids tensor, with no host read-back. Same values as the per-row path up to float rounding. `=2` also runs the per-row path and compares both (slow, debug). |
-| `GGML_SYCL_TINY_FUSE=7` | `ggml/src/ggml-sycl/ggml-sycl.cpp` | Merges runs of tiny kernels in the graph loop (bit 1: unary chains, 2: add runs, 4: copy runs): 3,483 -> 2,569 launches per one-token step. |
+| `GGML_SYCL_TINY_FUSE=15` | `ggml/src/ggml-sycl/ggml-sycl.cpp`, `concat.cpp` | Merges runs of tiny kernels in the graph loop (bit 1: unary chains, 2: add runs, 4: copy runs): 3,483 -> 2,569 launches per one-token step. Bit 8: leaner CONCAT and copy kernels for the conv state (no 64-bit divisions, one work-item per element), ~40 -> 11 us each, 36 x per step. |
+| `GGML_SYCL_GDN_STATE_DIRECT=1` | `ggml-sycl.cpp`, `gated_delta_net.cpp`, `.hpp` | The gated-delta-net kernel reads its recurrent state straight from the state cache instead of a 3 MB GET_ROWS copy per layer (36 per step). Same values (`=2` compares both). Together with bit 8: 3.1 ms less per MTP step, +2.9 %. |
 | `LLAMA_QWEN4EXP_CONV_STATE_NOCONT=1` | `src/models/qwen4exp.cpp` | Copies the strided recurrent-state tail straight into its slot (one launch less per slot, 216 per token). |
 | `GGML_SYCL_PROFILE=1/2/3` | `ggml/src/ggml-sycl/ggml-sycl.cpp` | Profiler: per-op times (serialized), launch counts, trace; per graph size and verify row count, with the host gap before each graph. |
 | (drafter file with `d2t`) | `src/models/qwen4exp.cpp`, `scripts/ptl/mtp_shortlist.py`, `shortlist-count.py`, `shortlist-scripts.py` | Alternative to `LLAMA_MTP_SHORTLIST`: a drafter GGUF whose output head has only the listed rows plus a `d2t` tensor with their token ids, made by `mtp_shortlist.py`. `LLAMA_MTP_SHORTLIST` is ignored for such a file. |
@@ -160,7 +161,7 @@ export GGML_SYCL_BF16_FAST=1 GGML_SYCL_TOP_K_MASK=1
 export GGML_SYCL_XMX_Q2_0=1 GGML_SYCL_DYNAMIC_PRECISION=BF16 GGML_SYCL_DNNL_FPMATH=bf16
 export GGML_SYCL_SPARSE_FA=1 GGML_SYCL_SPARSE_FA_ROWS=8 GGML_SYCL_FA_SKIP_MASKED=1
 export GGML_SYCL_XMX_PTL=1 LLAMA_MTP_SHORTLIST=scripts/ptl/mtp-shortlist-plc-96k.txt
-export GGML_SYCL_MMID_SHARED=1 GGML_SYCL_TINY_FUSE=7 LLAMA_QWEN4EXP_CONV_STATE_NOCONT=1
+export GGML_SYCL_MMID_SHARED=1 GGML_SYCL_TINY_FUSE=15 LLAMA_QWEN4EXP_CONV_STATE_NOCONT=1 GGML_SYCL_GDN_STATE_DIRECT=1
 export UR_L0_USE_DRIVER_INORDER_LISTS=1
 taskset -c 0-3 build/bin/llama-server \
     -m ~/models/Q2_0_hcq8/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf \
@@ -193,7 +194,7 @@ source /opt/intel/oneapi/setvars.sh
 export ONEAPI_DEVICE_SELECTOR=level_zero:0 GGML_SYCL_Q2_0_FAST=1 GGML_SYCL_MMID_SMALL_BATCH=8
 export GGML_SYCL_BF16_FAST=1 GGML_SYCL_XMX_Q2_0=1 GGML_SYCL_DYNAMIC_PRECISION=BF16 GGML_SYCL_DNNL_FPMATH=bf16
 export GGML_SYCL_SPARSE_FA=1 GGML_SYCL_SPARSE_FA_ROWS=8 GGML_SYCL_FA_SKIP_MASKED=1 GGML_SYCL_XMX_PTL=1
-export GGML_SYCL_MMID_SHARED=1 GGML_SYCL_TINY_FUSE=7
+export GGML_SYCL_MMID_SHARED=1 GGML_SYCL_TINY_FUSE=15 GGML_SYCL_GDN_STATE_DIRECT=1
 build/bin/test-backend-ops test -o MUL_MAT_ID -b SYCL0 -p "type_a=q2_0"
 build/bin/test-backend-ops test -o MUL_MAT -b SYCL0 -p "type_a=(q3_K|iq4_xs|q4_K|q5_K|q6_K|q8_0|bf16|f32),type_b=f32"
 build/bin/test-backend-ops test -o FLASH_ATTN_EXT -b SYCL0 -p "hsk=256"
