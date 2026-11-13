@@ -1,9 +1,9 @@
 diff --git a/README-PTL-Qwen38.md b/README-PTL-Qwen38.md
 new file mode 100644
-index 000000000..1c7897c98
+index 000000000..57721212d
 --- /dev/null
 +++ b/README-PTL-Qwen38.md
-@@ -0,0 +1,210 @@
+@@ -0,0 +1,211 @@
 +# Qwen3.8-Flash-Next on Intel Panther Lake (llama.cpp SYCL)
 +
 +This fork runs Qwen3.8-Flash-Next (Q2_0, 177B MoE) with MTP speculative decoding on the Arc B390 iGPU of Panther Lake. Upstream base: tag `b11836` (commit `f5027fb21`). Branch: `ptl-qwen38`.
@@ -19,9 +19,10 @@ index 000000000..1c7897c98
 +| 8 Nov: + Q8_0 hyper-connections, prefill on XMX, sparse attention | 30.1 over Agents4PLC | 66.7 % (67.5 %) |
 +| 11 Nov: + XMX for the MTP verify rows (`GGML_SYCL_XMX_PTL`) | 33.1 over Agents4PLC | 65.8 % (66.7 %) |
 +| 11 Nov: + MTP drafter vocabulary shortlist | 34.5 over Agents4PLC | 66.7 % (67.5 %) |
-+| **12 Nov: + shared-expert verify kernel, tiny-kernel fusion, n-gram + probabilistic drafts (start script default)** | **41.1 over Agents4PLC** | **67.5 % (68.4 %)** |
++| 12 Nov: + shared-expert verify kernel, tiny-kernel fusion, n-gram + probabilistic drafts | 41.1 over Agents4PLC | 67.5 % (68.4 %) |
++| **13 Nov: + Level Zero in-order lists, state read in place, leaner conv-state kernels (start script default)** | **47.6 over Agents4PLC** | **65.0 % (65.8 %)** |
 +
-+Agent-style requests (opencode-like CODESYS prompts, thinking on, reasoning effort medium, temperature 1.0): 25.4 tok/s with the 8 Nov setup, 28.5 with the 11 Nov parts, 35.0 with the 12 Nov parts, 40.0 with `UR_L0_USE_DRIVER_INORDER_LISTS=1`, **41.0 with the 13 Nov state-read and conv-state kernels** (start script default; Agents4PLC not yet rerun with it).
++Agent-style requests (opencode-like CODESYS prompts, thinking on, reasoning effort medium, temperature 1.0): 25.4 tok/s with the 8 Nov setup, 28.5 with the 11 Nov parts, 35.0 with the 12 Nov parts, 40.0 with `UR_L0_USE_DRIVER_INORDER_LISTS=1`, **41.0 with the 13 Nov state-read and conv-state kernels** (start script default).
 +
 +Six test requests of the NUC A/B script (thinking off), 8 Nov setup -> all parts -> + in-order lists: 28.2 -> 39.6 -> 45.6 tok/s (file rewrite 64.5).
 +
@@ -101556,13 +101557,13 @@ index 000000000..f67db2adb
 +    print("classes written to", sys.argv[3])
 diff --git a/scripts/ptl/start-qwen38-server.sh b/scripts/ptl/start-qwen38-server.sh
 new file mode 100755
-index 000000000..44387c33d
+index 000000000..fefb4176c
 --- /dev/null
 +++ b/scripts/ptl/start-qwen38-server.sh
 @@ -0,0 +1,111 @@
 +#!/usr/bin/env bash
 +# Qwen3.8-Flash-Next Q2_0 + MTP on Intel Panther Lake (Arc B390 iGPU), llama.cpp SYCL.
-+# Verified setup: 41.1 tok/s decode over Agents4PLC (strict pass 67.5 %) before UR_L0_USE_DRIVER_INORDER_LISTS (+14 %), prefill ~225 tok/s at 34k context.
++# Verified setup: 47.6 tok/s decode over Agents4PLC (strict pass 65.0 %, baseline 65.0 %), prefill ~225 tok/s at 34k context.
 +# No root needed.
 +#
 +# THINK=1 (default): thinking on, reasoning effort medium, --reasoning-preserve (agent use, e.g. opencode).

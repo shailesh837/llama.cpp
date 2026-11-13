@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Qwen3.8-Flash-Next Q2_0 + MTP on Intel Panther Lake (Arc B390 iGPU), llama.cpp SYCL.
-# Verified setup: 41.1 tok/s decode over Agents4PLC (strict pass 67.5 %) before UR_L0_USE_DRIVER_INORDER_LISTS (+14 %), prefill ~225 tok/s at 34k context.
+# Verified setup: 47.6 tok/s decode over Agents4PLC (strict pass 65.0 %, baseline 65.0 %), prefill ~225 tok/s at 34k context.
 # No root needed.
 #
 # THINK=1 (default): thinking on, reasoning effort medium, --reasoning-preserve (agent use, e.g. opencode).
