@@ -17,6 +17,7 @@
 #include <vector>
 #include <map>
 #include <algorithm>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <cstdio>
@@ -403,7 +404,19 @@ struct common_params_speculative {
             return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
         });
 
-        return needs_rs_seq ? draft.n_max : 0u;
+        if (!needs_rs_seq) {
+            return 0u;
+        }
+        // LLAMA_SPEC_RS_SEQ_NGRAM=1: n-gram drafts in front of the MTP drafts can be longer than draft.n_max. Without
+        // rollback snapshots for their length the server takes a state checkpoint before every such draft (and
+        // restores it on a partial accept), which reads the recurrent state of every layer back to the host.
+        uint32_t n = (uint32_t) draft.n_max;
+        const char * e = getenv("LLAMA_SPEC_RS_SEQ_NGRAM");
+        if (e != nullptr && atoi(e) != 0 && ngram_mod.n_max > 0 && ngram_mod.n_max <= 8 &&
+            std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_NGRAM_MOD) != types.end()) {
+            n = std::max(n, (uint32_t) ngram_mod.n_max);
+        }
+        return n;
     }
 };
 

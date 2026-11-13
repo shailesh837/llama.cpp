@@ -30,3 +30,21 @@ void ggml_sycl_op_gated_delta_net_fused_cache(ggml_backend_sycl_context & ctx, g
 void ggml_sycl_op_gated_delta_net_ex(ggml_backend_sycl_context & ctx, ggml_tensor * dst,
                                      const ggml_sycl_gated_delta_net_fused_cache *  cache,
                                      const ggml_sycl_gated_delta_net_direct_state * direct);
+
+// GGML_SYCL_GDN_LAZY: the kernel keeps the state before the step (base) plus the update terms of the step's tokens
+// (stash) instead of one state snapshot per token; see gdn_lazy_args in gated_delta_net.cpp. One sequence only.
+struct ggml_sycl_gated_delta_net_lazy {
+    const float * base_in;
+    float *       base_out;
+    const float * stash_prev;
+    float *       stash_new;
+    int           n_replay;
+    bool          write_base;
+};
+
+void ggml_sycl_op_gated_delta_net_lazy(ggml_backend_sycl_context & ctx, ggml_tensor * dst,
+                                       const ggml_sycl_gated_delta_net_lazy & lazy);
+
+// writes the snapshots a lazy cell stands for (slot s = state s tokens before the end of the stashed step)
+bool ggml_sycl_gdn_materialize(dpct::queue_ptr stream, int64_t S_v, int64_t H, bool kda, const float * base,
+                               const float * stash, float * planes, int64_t slot_stride, int n_prev, int K);

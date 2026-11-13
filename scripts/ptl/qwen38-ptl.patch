@@ -1,9 +1,9 @@
 diff --git a/README-PTL-Qwen38.md b/README-PTL-Qwen38.md
 new file mode 100644
-index 000000000..57721212d
+index 000000000..fabdb9fea
 --- /dev/null
 +++ b/README-PTL-Qwen38.md
-@@ -0,0 +1,211 @@
+@@ -0,0 +1,217 @@
 +# Qwen3.8-Flash-Next on Intel Panther Lake (llama.cpp SYCL)
 +
 +This fork runs Qwen3.8-Flash-Next (Q2_0, 177B MoE) with MTP speculative decoding on the Arc B390 iGPU of Panther Lake. Upstream base: tag `b11836` (commit `f5027fb21`). Branch: `ptl-qwen38`.
@@ -20,9 +20,10 @@ index 000000000..57721212d
 +| 11 Nov: + XMX for the MTP verify rows (`GGML_SYCL_XMX_PTL`) | 33.1 over Agents4PLC | 65.8 % (66.7 %) |
 +| 11 Nov: + MTP drafter vocabulary shortlist | 34.5 over Agents4PLC | 66.7 % (67.5 %) |
 +| 12 Nov: + shared-expert verify kernel, tiny-kernel fusion, n-gram + probabilistic drafts | 41.1 over Agents4PLC | 67.5 % (68.4 %) |
-+| **13 Nov: + Level Zero in-order lists, state read in place, leaner conv-state kernels (start script default)** | **47.6 over Agents4PLC** | **65.0 % (65.8 %)** |
++| 13 Nov: + Level Zero in-order lists, state read in place, leaner conv-state kernels | 47.6 over Agents4PLC | 65.0 % (65.8 %) |
++| **13 Nov: + drafter FFN only for output rows, lazy recurrent-state snapshots (start script default)** | **51.0 over Agents4PLC** | **66.7 % (67.5 %)** |
 +
-+Agent-style requests (opencode-like CODESYS prompts, thinking on, reasoning effort medium, temperature 1.0): 25.4 tok/s with the 8 Nov setup, 28.5 with the 11 Nov parts, 35.0 with the 12 Nov parts, 40.0 with `UR_L0_USE_DRIVER_INORDER_LISTS=1`, **41.0 with the 13 Nov state-read and conv-state kernels** (start script default).
++Agent-style requests (opencode-like CODESYS prompts, thinking on, reasoning effort medium, temperature 1.0): 25.4 tok/s with the 8 Nov setup, 28.5 with the 11 Nov parts, 35.0 with the 12 Nov parts, 40.0 with `UR_L0_USE_DRIVER_INORDER_LISTS=1`, 41.0 with the 13 Nov state-read and conv-state kernels, **43.7 with the drafter and lazy-snapshot changes** (start script default).
 +
 +Six test requests of the NUC A/B script (thinking off), 8 Nov setup -> all parts -> + in-order lists: 28.2 -> 39.6 -> 45.6 tok/s (file rewrite 64.5).
 +
@@ -60,6 +61,9 @@ index 000000000..57721212d
 +| `LLAMA_QWEN4EXP_CONV_STATE_NOCONT=1` | `src/models/qwen4exp.cpp` | Copies the strided recurrent-state tail straight into its slot (one launch less per slot, 216 per token). |
 +| `GGML_SYCL_PROFILE=1/2/3` | `ggml/src/ggml-sycl/ggml-sycl.cpp` | Profiler: per-op times (serialized), launch counts, trace; per graph size and verify row count, with the host gap before each graph. |
 +| (drafter file with `d2t`) | `src/models/qwen4exp.cpp`, `scripts/ptl/mtp_shortlist.py`, `shortlist-count.py`, `shortlist-scripts.py` | Alternative to `LLAMA_MTP_SHORTLIST`: a drafter GGUF whose output head has only the listed rows plus a `d2t` tensor with their token ids, made by `mtp_shortlist.py`. `LLAMA_MTP_SHORTLIST` is ignored for such a file. |
++| `LLAMA_QWEN4EXP_MTP_CROP_FFN=1` | `src/models/qwen4exp.cpp` | The MTP drafter narrows to its output rows before the FFN. The catch-up decode after every verify step (it only fills the drafter's attention cache, no output row) then skips the FFN, whose experts were ~70 % of that graph. The skipped values were never read. 3.4 ms less per MTP step, +3.9 %. |
++| `GGML_SYCL_GDN_LAZY=1` | `ggml/src/ggml-sycl/gated_delta_net.cpp`, `.hpp`, `ggml-sycl.cpp` | Rollback snapshots of the recurrent state as update terms. A verify step of n rows wrote n copies of every recurrent layer's state (3 MB x 36 layers per copy). Now slot 0 keeps the state before the step and a small stash keeps k, delta and exp(g) per token; the next step replays the tokens that were kept and writes one copy. Any other access to the state cache (tensor get/set/copy/memset, buffer clear, another graph node) first turns the cell back into snapshots. Same values: `=2` runs the snapshot kernel on a shadow cache and compares (8,444 checks, 0 differ). Needs `GGML_SYCL_GDN_STATE_DIRECT=1`. |
++| `LLAMA_SPEC_RS_SEQ_NGRAM=1` | `common/common.h` | The rollback depth (`n_rs_seq`) also covers the n-gram draft length (up to 8) instead of the MTP draft length only. Otherwise the server takes a state checkpoint before every n-gram draft longer than the MTP n-max, which reads all recurrent states back to the host. With the two switches above: 2.9 ms less per step, +2.1 %. |
 +| `GGML_SYCL_FA_SKIP_MASKED=1` | `ggml/src/ggml-sycl/fattn-tile.hpp` | Flash attention skips KV tiles whose mask is -inf for every row of the block. |
 +| (tests) | `tests/test-backend-ops.cpp` | Perf and eval cases for the model's shapes: Q2_0 experts 640x2560 / 2560x640 (512 experts / 10 used, 1-2048 tokens), BF16 hyper-connection shapes, sparse attention with 2-8 rows. |
 +| (tool) | `scripts/ptl/bf16_to_q8.cpp` | Rewrites the first model split with the hyper-connection and router tensors (240 tensors) in Q8_0 instead of BF16. |
@@ -170,6 +174,7 @@ index 000000000..57721212d
 +export GGML_SYCL_XMX_PTL=1 LLAMA_MTP_SHORTLIST=scripts/ptl/mtp-shortlist-plc-96k.txt
 +export GGML_SYCL_MMID_SHARED=1 GGML_SYCL_TINY_FUSE=15 LLAMA_QWEN4EXP_CONV_STATE_NOCONT=1 GGML_SYCL_GDN_STATE_DIRECT=1
 +export UR_L0_USE_DRIVER_INORDER_LISTS=1
++export LLAMA_QWEN4EXP_MTP_CROP_FFN=1 GGML_SYCL_GDN_LAZY=1 LLAMA_SPEC_RS_SEQ_NGRAM=1
 +taskset -c 0-3 build/bin/llama-server \
 +    -m ~/models/Q2_0_hcq8/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf \
 +    -lm dio -lzm on -ngl 99 -fa on --jinja --reasoning on --reasoning-preserve --reasoning-effort medium \
@@ -188,7 +193,7 @@ index 000000000..57721212d
 +- `-c 65536` leaves ~14 GB of RAM free after the load on a 61 GiB machine. The model is served as `qwen38-flash-next-q2_0-mtp`.
 +- Prompt processing: ~225 tok/s on long prompts (34k tokens in ~150 s). Follow-up turns reuse the cached prefix, so only new content (file reads, tool results) is processed.
 +- `--reasoning-preserve` (the llama-server default) keeps earlier assistant turns in the history exactly as they were generated. With `--no-reasoning-preserve` the chat template drops the think block of every assistant turn before the last user message. In agent sessions (opencode, tool calls) the turns of the previous round were cached with their think block, so the next user message no longer matches the KV cache from the first assistant turn of that round, and all tool results since then are processed again (reported: 75-86 s instead of ~4 s per follow-up at long context). Plain chat, 5 follow-ups at 8-13k context: 160 tokens of prefill with preserve vs 245-1,209 without.
-+- Thinking: the start script runs with thinking on and `--reasoning-effort medium` (`THINK=0` turns thinking off). The Qwen3.8 chat template defaults to `xhigh`; in an opencode benchmark on pick & place CODESYS tasks, medium gave better results than xhigh. Thinking text decodes slower than code (lower draft acceptance), so agent turns run at ~35 tok/s rather than the 41 of Agents4PLC (no thinking, temperature 0). Use the sampling defaults of the model (temperature 1.0, top-k 20, top-p 0.95, in the GGUF).
++- Thinking: the start script runs with thinking on and `--reasoning-effort medium` (`THINK=0` turns thinking off). The Qwen3.8 chat template defaults to `xhigh`; in an opencode benchmark on pick & place CODESYS tasks, medium gave better results than xhigh. Thinking text decodes slower than code (lower draft acceptance), so agent turns run at ~44 tok/s rather than the 51 of Agents4PLC (no thinking, temperature 0). Use the sampling defaults of the model (temperature 1.0, top-k 20, top-p 0.95, in the GGUF).
 +- `-cram 0` turns off the host-RAM prompt cache, which grew 120-230 MB per request until 8 GB and pushed the machine into swap with `-c 65536`. SYCL graphs (`GGML_SYCL_ENABLE_GRAPH`) stay off: with MTP no graph is replayed and the graph cache grows ~110 MB per request.
 +- Drafts: n-gram drafts of 3-7 tokens (text the model re-emits, e.g. a file rewrite) go before the MTP drafts, and MTP drafts are sampled (`probabilistic`). Keep the n-gram `n-max` at 7 or less: a verify of more than 8 rows leaves the 8-row fast paths (small-batch experts, 8-column mat-vec, sparse attention rows) and gets much slower. In the start script `SPEC=0` goes back to MTP only with greedy drafts, `KERN=0` turns off the three 12 Nov kernel switches.
 +- `UR_L0_USE_DRIVER_INORDER_LISTS=1` (a oneAPI Unified Runtime setting, no code change): the Level Zero driver keeps the kernels of the in-order queue in order itself instead of the adapter tracking every launch. A decode step has ~2,600 small kernels, and the adapter's bookkeeping cost ~5 us each: 13 ms less per MTP step, +14 % decode. The newer adapter (`UR_LOADER_USE_LEVEL_ZERO_V2=1`) gave the same speed; the script keeps the adapter all other measurements used. `L0IO=0` turns it off.
@@ -201,12 +206,13 @@ index 000000000..57721212d
 +export ONEAPI_DEVICE_SELECTOR=level_zero:0 GGML_SYCL_Q2_0_FAST=1 GGML_SYCL_MMID_SMALL_BATCH=8
 +export GGML_SYCL_BF16_FAST=1 GGML_SYCL_XMX_Q2_0=1 GGML_SYCL_DYNAMIC_PRECISION=BF16 GGML_SYCL_DNNL_FPMATH=bf16
 +export GGML_SYCL_SPARSE_FA=1 GGML_SYCL_SPARSE_FA_ROWS=8 GGML_SYCL_FA_SKIP_MASKED=1 GGML_SYCL_XMX_PTL=1
-+export GGML_SYCL_MMID_SHARED=1 GGML_SYCL_TINY_FUSE=15 GGML_SYCL_GDN_STATE_DIRECT=1
++export GGML_SYCL_MMID_SHARED=1 GGML_SYCL_TINY_FUSE=15 GGML_SYCL_GDN_STATE_DIRECT=1 GGML_SYCL_GDN_LAZY=1
 +build/bin/test-backend-ops test -o MUL_MAT_ID -b SYCL0 -p "type_a=q2_0"
 +build/bin/test-backend-ops test -o MUL_MAT -b SYCL0 -p "type_a=(q3_K|iq4_xs|q4_K|q5_K|q6_K|q8_0|bf16|f32),type_b=f32"
 +build/bin/test-backend-ops test -o FLASH_ATTN_EXT -b SYCL0 -p "hsk=256"
 +build/bin/test-backend-ops test -o SET_ROWS -b SYCL0      # used by LLAMA_MTP_SHORTLIST
 +build/bin/test-backend-ops test -o FILL -b SYCL0
++build/bin/test-backend-ops test -o GATED_DELTA_NET -b SYCL0
 +```
 +
 +All cases should pass against the CPU backend, except two `FLASH_ATTN_EXT` cases that also fail with every switch off (not caused by this branch's switches) (`nr23=[16,1],kv=1025,nb=64` with q8_0 cache and `nr23=[12,2],kv=8192,nb=67`).
@@ -215,6 +221,39 @@ index 000000000..57721212d
 +
 +- The first server launch after a reboot was ~17 % slower in one test (plain decode 11.3 vs 13.5 tok/s with the Q2_0 kernel); later launches were at full speed. Not yet explained.
 +- Output text differs between runs even at temperature 0 (non-deterministic GPU reductions), so compare accuracy with a benchmark, not with identical text.
+diff --git a/common/common.h b/common/common.h
+index 70d6a671f..a455bcf92 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -17,6 +17,7 @@
+ #include <vector>
+ #include <map>
+ #include <algorithm>
++#include <cstdlib>
+ #include <filesystem>
+ #include <fstream>
+ #include <cstdio>
+@@ -403,7 +404,19 @@ struct common_params_speculative {
+             return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+         });
+ 
+-        return needs_rs_seq ? draft.n_max : 0u;
++        if (!needs_rs_seq) {
++            return 0u;
++        }
++        // LLAMA_SPEC_RS_SEQ_NGRAM=1: n-gram drafts in front of the MTP drafts can be longer than draft.n_max. Without
++        // rollback snapshots for their length the server takes a state checkpoint before every such draft (and
++        // restores it on a partial accept), which reads the recurrent state of every layer back to the host.
++        uint32_t n = (uint32_t) draft.n_max;
++        const char * e = getenv("LLAMA_SPEC_RS_SEQ_NGRAM");
++        if (e != nullptr && atoi(e) != 0 && ngram_mod.n_max > 0 && ngram_mod.n_max <= 8 &&
++            std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_NGRAM_MOD) != types.end()) {
++            n = std::max(n, (uint32_t) ngram_mod.n_max);
++        }
++        return n;
+     }
+ };
+ 
 diff --git a/ggml/src/ggml-sycl/common.hpp b/ggml/src/ggml-sycl/common.hpp
 index 8f2f892bc..8b4b2b234 100644
 --- a/ggml/src/ggml-sycl/common.hpp
@@ -798,21 +837,49 @@ index 226676d12..5a9508255 100644
      }
  }
 diff --git a/ggml/src/ggml-sycl/gated_delta_net.cpp b/ggml/src/ggml-sycl/gated_delta_net.cpp
-index 8468bbf5b..1c4920772 100644
+index 8468bbf5b..ae63ea816 100644
 --- a/ggml/src/ggml-sycl/gated_delta_net.cpp
 +++ b/ggml/src/ggml-sycl/gated_delta_net.cpp
-@@ -30,7 +30,9 @@ void gated_delta_net_sycl(const float *     q,
+@@ -6,7 +6,25 @@
+ #include <cmath>
+ 
+ 
+-template <int S_v, bool KDA, bool keep_rs_t>
++// GGML_SYCL_GDN_LAZY: state update of one element, the same expression in the token loop and in the replays
++static __dpct_inline__ float gdn_state_upd(float g, float s, float k, float d) {
++    return g * s + k * d;
++}
++
++// GGML_SYCL_GDN_LAZY: the cache keeps the state before the last step (base) and, per token of that step, the
++// update terms k, delta and exp(g) (stash). The kernel replays the tokens that were kept, stores the result as
++// the new base and stashes the terms of its own tokens instead of writing a state snapshot per token.
++// A stash token is [k: H*S_v][delta: H*S_v][exp(g): H*S_v] (exp(g) at [h*S_v] only when g is one value per head).
++struct gdn_lazy_args {
++    const float * base_in;     // state row to start from
++    float *       base_out;    // row that receives the state after the replay
++    const float * stash_prev;  // terms of the previous step
++    float *       stash_new;   // terms of this step
++    int           n_replay;    // tokens of the previous step to apply first
++    int           write_base;
++};
++
++template <int S_v, bool KDA, bool keep_rs_t, bool LAZY>
+ void gated_delta_net_sycl(const float *     q,
+                           const float *     k,
+                           const float *     v,
+@@ -30,7 +48,10 @@ void gated_delta_net_sycl(const float *     q,
                            const sycl::uint3 rq3_magic,
                            float             scale,
                            int64_t           state_slot_stride,
 -                          int               K) {
 +                          int               K,
 +                          const int32_t *   s_ids,
-+                          int64_t           s_row_stride) {
++                          int64_t           s_row_stride,
++                          const gdn_lazy_args lazy) {
      auto           item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
      const uint32_t h_idx    = item_ct1.get_group(2);
      const uint32_t sequence = item_ct1.get_group(1);
-@@ -45,7 +47,11 @@ void gated_delta_net_sycl(const float *     q,
+@@ -45,7 +66,11 @@ void gated_delta_net_sycl(const float *     q,
  
      // input state holds s0 only [S_v, S_v, H, n_seqs] — seq stride is D = H * S_v * S_v.
      // output state layout (per-slot D * n_seqs) — same per-(seq,head) offset as before.
@@ -825,62 +892,207 @@ index 8468bbf5b..1c4920772 100644
      const int64_t state_out_offset     = (sequence * H + h_idx) * S_v * S_v;
      state += state_out_offset;
      curr_state += state_in_offset + col * S_v;
-@@ -189,6 +195,8 @@ static void launch_gated_delta_net(const float *   q_d,
+@@ -55,10 +80,37 @@ void gated_delta_net_sycl(const float *     q,
+     static_assert(S_v % warp_size == 0, "S_v must be a multiple of warp_size");
+     constexpr int rows_per_lane = (S_v + warp_size - 1) / warp_size;
+     float         s_shard[rows_per_lane];
++    const int64_t hs_tok = 3 * H * S_v;   // floats per stash token
++    if constexpr (LAZY) {
++        const int64_t el = (int64_t) h_idx * S_v * S_v + (int64_t) col * S_v;
+ #pragma unroll
+-    for (int r = 0; r < rows_per_lane; r++) {
+-        const int i = r * warp_size + lane;
+-        s_shard[r]  = curr_state[i];
++        for (int r = 0; r < rows_per_lane; r++) {
++            const int i = r * warp_size + lane;
++            s_shard[r]  = lazy.base_in[el + i];
++        }
++        for (int t = 0; t < lazy.n_replay; t++) {
++            const float * st = lazy.stash_prev + t * hs_tok + (int64_t) h_idx * S_v;
++            const float   d  = st[H * S_v + col];
++            const float * gp = st + 2 * H * S_v;
++#pragma unroll
++            for (int r = 0; r < rows_per_lane; r++) {
++                const int i = r * warp_size + lane;
++                s_shard[r]  = gdn_state_upd(KDA ? gp[i] : gp[0], s_shard[r], st[i], d);
++            }
++        }
++        if (lazy.write_base) {
++#pragma unroll
++            for (int r = 0; r < rows_per_lane; r++) {
++                const int i = r * warp_size + lane;
++                lazy.base_out[el + i] = s_shard[r];
++            }
++        }
++    } else {
++#pragma unroll
++        for (int r = 0; r < rows_per_lane; r++) {
++            const int i = r * warp_size + lane;
++            s_shard[r]  = curr_state[i];
++        }
+     }
+ 
+     // snapshot slot mapping: slot 0 = most recent state, slot s = s tokens back.
+@@ -96,7 +148,7 @@ void gated_delta_net_sycl(const float *     q,
+ #pragma unroll
+             for (int r = 0; r < rows_per_lane; r++) {
+                 const int i = r * warp_size + lane;
+-                s_shard[r]  = g_val * s_shard[r] + k_t[i] * delta_col;
++                s_shard[r]  = gdn_state_upd(g_val, s_shard[r], k_t[i], delta_col);
+                 attn_partial += s_shard[r] * q_t[i];
+             }
+ 
+@@ -105,6 +157,22 @@ void gated_delta_net_sycl(const float *     q,
+             if (lane == 0) {
+                 attn_data[col] = attn_col * scale;
+             }
++            if constexpr (LAZY) {
++                float * st = lazy.stash_new + t * hs_tok + (int64_t) h_idx * S_v;
++                if (lane == 0) {
++                    st[H * S_v + col] = delta_col;
++                }
++                if (col == 0) {
++                    if (lane == 0) {
++                        st[2 * H * S_v] = g_val;
++                    }
++#pragma unroll
++                    for (int r = 0; r < rows_per_lane; r++) {
++                        const int i = r * warp_size + lane;
++                        st[i]       = k_t[i];
++                    }
++                }
++            }
+         } else {
+             // kv[col] = sum_i g[i] * S[i][col] * k[i]
+             float kv_shard = 0.0f;
+@@ -125,12 +193,27 @@ void gated_delta_net_sycl(const float *     q,
+ #pragma unroll
+             for (int r = 0; r < rows_per_lane; r++) {
+                 const int i = r * warp_size + lane;
+-                s_shard[r]  = sycl::native::exp(g_t[i]) * s_shard[r] + k_t[i] * delta_col;
++                s_shard[r]  = gdn_state_upd(sycl::native::exp(g_t[i]), s_shard[r], k_t[i], delta_col);
+                 attn_partial += s_shard[r] * q_t[i];
+             }
+ 
+             float attn_col = warp_reduce_sum<warp_size>(attn_partial);
+ 
++            if constexpr (LAZY) {
++                float * st = lazy.stash_new + t * hs_tok + (int64_t) h_idx * S_v;
++                if (lane == 0) {
++                    st[H * S_v + col] = delta_col;
++                }
++                if (col == 0) {
++#pragma unroll
++                    for (int r = 0; r < rows_per_lane; r++) {
++                        const int i           = r * warp_size + lane;
++                        st[i]                 = k_t[i];
++                        st[2 * H * S_v + i]   = sycl::native::exp(g_t[i]);
++                    }
++                }
++            }
++
+             if (lane == 0) {
+                 attn_data[col] = attn_col * scale;
+             }
+@@ -140,7 +223,7 @@ void gated_delta_net_sycl(const float *     q,
+ 
+ 
+     // Write state back to global memory
+-        if constexpr (keep_rs_t) {
++        if constexpr (keep_rs_t && !LAZY) {
+             const int target_slot = (int) n_tokens - 1 - t;
+             if (target_slot >= 0 && target_slot < K) {
+                 float * curr_state = state + target_slot * state_slot_stride;
+@@ -153,7 +236,7 @@ void gated_delta_net_sycl(const float *     q,
+         }
+     }
+ 
+-    if constexpr (!keep_rs_t) {
++    if constexpr (!keep_rs_t && !LAZY) {
+ #pragma unroll
+         for (int r = 0; r < rows_per_lane; r++) {
+             const int i          = r * warp_size + lane;
+@@ -162,7 +245,7 @@ void gated_delta_net_sycl(const float *     q,
+     }
+ }
+ 
+-template <bool KDA, bool keep_rs_t>
++template <bool KDA, bool keep_rs_t, bool LAZY = false>
+ static void launch_gated_delta_net(const float *   q_d,
+                                    const float *   k_d,
+                                    const float *   v_d,
+@@ -189,7 +272,10 @@ static void launch_gated_delta_net(const float *   q_d,
                                     float           scale,
                                     int64_t         state_slot_stride,
                                     int             K,
+-                                   dpct::queue_ptr stream) {
 +                                   const int32_t * s_ids,
 +                                   int64_t         s_row_stride,
-                                    dpct::queue_ptr stream) {
++                                   dpct::queue_ptr stream,
++                                   const gdn_lazy_args lazy = {}) {
      //TODO: Add chunked kernel for even faster pre-fill
      const int warp_size = ggml_sycl_info().devices[ggml_sycl_get_device()].warp_size;
-@@ -208,7 +216,7 @@ static void launch_gated_delta_net(const float *   q_d,
+ 
+@@ -206,9 +292,9 @@ static void launch_gated_delta_net(const float *   q_d,
+                 constexpr int sv = 16;
+                 stream->parallel_for(sycl::nd_range<3>(grid_dims * block_dims, block_dims),
                                       [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                                          gated_delta_net_sycl<sv, KDA, keep_rs_t>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens,
+-                                         gated_delta_net_sycl<sv, KDA, keep_rs_t>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens,
++                                         gated_delta_net_sycl<sv, KDA, keep_rs_t, LAZY>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens,
                                                                         sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2,
 -                                                                       sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
-+                                                                       sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, s_ids, s_row_stride);
++                                                                       sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, s_ids, s_row_stride, lazy);
                                       });
              }
              break;
-@@ -219,7 +227,7 @@ static void launch_gated_delta_net(const float *   q_d,
+@@ -217,9 +303,9 @@ static void launch_gated_delta_net(const float *   q_d,
+                 constexpr int sv = 32;
+                 stream->parallel_for(sycl::nd_range<3>(grid_dims * block_dims, block_dims),
                                       [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                                          gated_delta_net_sycl<sv, KDA, keep_rs_t>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens,
+-                                         gated_delta_net_sycl<sv, KDA, keep_rs_t>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens,
++                                         gated_delta_net_sycl<sv, KDA, keep_rs_t, LAZY>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens,
                                                                         sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2,
 -                                                                       sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
-+                                                                       sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, s_ids, s_row_stride);
++                                                                       sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, s_ids, s_row_stride, lazy);
                                       });
              }
              break;
-@@ -230,7 +238,7 @@ static void launch_gated_delta_net(const float *   q_d,
+@@ -228,9 +314,9 @@ static void launch_gated_delta_net(const float *   q_d,
+                 constexpr int sv = 64;
+                 stream->parallel_for(sycl::nd_range<3>(grid_dims * block_dims, block_dims),
                                          [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                                             gated_delta_net_sycl<sv, KDA, keep_rs_t>(
+-                                            gated_delta_net_sycl<sv, KDA, keep_rs_t>(
++                                            gated_delta_net_sycl<sv, KDA, keep_rs_t, LAZY>(
                                                  q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens, sq1, sq2,
 -                                                sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
-+                                                sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, s_ids, s_row_stride);
++                                                sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, s_ids, s_row_stride, lazy);
                                          });
              }
              break;
-@@ -242,7 +250,7 @@ static void launch_gated_delta_net(const float *   q_d,
+@@ -240,9 +326,9 @@ static void launch_gated_delta_net(const float *   q_d,
+                 constexpr int sv = 128;
+                 stream->parallel_for(sycl::nd_range<3>(grid_dims * block_dims, block_dims),
                                          [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                                             gated_delta_net_sycl<sv, KDA, keep_rs_t>(
+-                                            gated_delta_net_sycl<sv, KDA, keep_rs_t>(
++                                            gated_delta_net_sycl<sv, KDA, keep_rs_t, LAZY>(
                                                  q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens, sq1, sq2,
 -                                                sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
-+                                                sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, s_ids, s_row_stride);
++                                                sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, s_ids, s_row_stride, lazy);
                                          });
              }
              break;
-@@ -254,7 +262,8 @@ static void launch_gated_delta_net(const float *   q_d,
+@@ -254,7 +340,9 @@ static void launch_gated_delta_net(const float *   q_d,
  }
  
  static void ggml_sycl_op_gated_delta_net_impl(ggml_backend_sycl_context & ctx, ggml_tensor * dst,
 -                                              const ggml_sycl_gated_delta_net_fused_cache * cache) {
 +                                              const ggml_sycl_gated_delta_net_fused_cache * cache,
-+                                              const ggml_sycl_gated_delta_net_direct_state * direct = nullptr) {
++                                              const ggml_sycl_gated_delta_net_direct_state * direct = nullptr,
++                                              const ggml_sycl_gated_delta_net_lazy * lazy = nullptr) {
      ggml_tensor * src_q     = dst->src[0];
      ggml_tensor * src_k     = dst->src[1];
      ggml_tensor * src_v     = dst->src[2];
-@@ -288,7 +297,9 @@ static void ggml_sycl_op_gated_delta_net_impl(ggml_backend_sycl_context & ctx, g
+@@ -288,7 +376,9 @@ static void ggml_sycl_op_gated_delta_net_impl(ggml_backend_sycl_context & ctx, g
      const float * g_d = (const float *) src_g->data;
      const float * b_d = (const float *) src_beta->data;
  
@@ -891,7 +1103,28 @@ index 8468bbf5b..1c4920772 100644
      float *       dst_d = (float *) dst->data;
  
      GGML_ASSERT(ggml_is_contiguous_rows(src_q));
-@@ -331,21 +342,21 @@ static void ggml_sycl_op_gated_delta_net_impl(ggml_backend_sycl_context & ctx, g
+@@ -327,25 +417,42 @@ static void ggml_sycl_op_gated_delta_net_impl(ggml_backend_sycl_context & ctx, g
+         state_slot_stride = cache->slot_stride;
+     }
+ 
++    if (lazy != nullptr) {
++        // GGML_SYCL_GDN_LAZY: no snapshot per token, see gdn_lazy_args
++        GGML_ASSERT(n_seqs == 1);
++        const gdn_lazy_args la = { lazy->base_in, lazy->base_out, lazy->stash_prev, lazy->stash_new, lazy->n_replay,
++                                   lazy->write_base ? 1 : 0 };
++        if (kda) {
++            launch_gated_delta_net<true, false, true>(q_d, k_d, v_d, g_d, b_d, nullptr, dst_d, nullptr,
++                S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
++                sb1, sb2, sb3, neqk1, rq3, scale, 0, K, nullptr, 0, stream, la);
++        } else {
++            launch_gated_delta_net<false, false, true>(q_d, k_d, v_d, g_d, b_d, nullptr, dst_d, nullptr,
++                S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
++                sb1, sb2, sb3, neqk1, rq3, scale, 0, K, nullptr, 0, stream, la);
++        }
++        return;
++    }
++
+     if (kda) {
          if (keep_rs) {
              launch_gated_delta_net<true, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
                  S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
@@ -917,7 +1150,7 @@ index 8468bbf5b..1c4920772 100644
          }
      }
  }
-@@ -364,3 +375,10 @@ void ggml_sycl_op_gated_delta_net_fused_cache(ggml_backend_sycl_context & ctx, g
+@@ -364,3 +471,102 @@ void ggml_sycl_op_gated_delta_net_fused_cache(ggml_backend_sycl_context & ctx, g
      scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/6);
      ggml_sycl_op_gated_delta_net_impl(ctx, dst, &cache);
  }
@@ -928,11 +1161,103 @@ index 8468bbf5b..1c4920772 100644
 +    scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/6);
 +    ggml_sycl_op_gated_delta_net_impl(ctx, dst, cache, direct);
 +}
++
++void ggml_sycl_op_gated_delta_net_lazy(ggml_backend_sycl_context & ctx, ggml_tensor * dst,
++                                       const ggml_sycl_gated_delta_net_lazy & lazy) {
++    scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/6);
++    ggml_sycl_op_gated_delta_net_impl(ctx, dst, nullptr, nullptr, &lazy);
++}
++
++// GGML_SYCL_GDN_LAZY: turn a lazy cell back into state snapshots. Applies the n_prev stashed tokens to the base
++// state and writes the state after token t (1-based) to slot n_prev - t, as the token loop of the kernel does;
++// with n_prev < K the base itself goes to slot n_prev. Every work-item reads its elements of the base before it
++// writes, so slot 0 may be the base row.
++template <int S_v, bool KDA>
++static void gdn_materialize_sycl(const float * base, const float * stash, float * planes, int64_t slot_stride,
++                                 int64_t H, int n_prev, int K) {
++    auto           item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
++    const uint32_t h_idx    = item_ct1.get_group(2);
++    const int      lane     = item_ct1.get_local_id(2);
++    const int      col      = item_ct1.get_group(0) * item_ct1.get_local_range(1) + item_ct1.get_local_id(1);
++
++    constexpr int warp_size = ggml_sycl_get_physical_warp_size() < S_v ? ggml_sycl_get_physical_warp_size() : S_v;
++    constexpr int rows_per_lane = (S_v + warp_size - 1) / warp_size;
++    float         s_shard[rows_per_lane];
++    const int64_t hs_tok = 3 * H * S_v;
++    const int64_t el     = (int64_t) h_idx * S_v * S_v + (int64_t) col * S_v;
++#pragma unroll
++    for (int r = 0; r < rows_per_lane; r++) {
++        const int i = r * warp_size + lane;
++        s_shard[r]  = base[el + i];
++    }
++    if (n_prev < K) {
++        float * out = planes + (int64_t) n_prev * slot_stride + el;
++#pragma unroll
++        for (int r = 0; r < rows_per_lane; r++) {
++            const int i = r * warp_size + lane;
++            out[i]      = s_shard[r];
++        }
++    }
++    for (int t = 0; t < n_prev; t++) {
++        const float * st = stash + t * hs_tok + (int64_t) h_idx * S_v;
++        const float   d  = st[H * S_v + col];
++        const float * gp = st + 2 * H * S_v;
++#pragma unroll
++        for (int r = 0; r < rows_per_lane; r++) {
++            const int i = r * warp_size + lane;
++            s_shard[r]  = gdn_state_upd(KDA ? gp[i] : gp[0], s_shard[r], st[i], d);
++        }
++        const int target_slot = n_prev - 1 - t;
++        if (target_slot < K) {
++            float * out = planes + (int64_t) target_slot * slot_stride + el;
++#pragma unroll
++            for (int r = 0; r < rows_per_lane; r++) {
++                const int i = r * warp_size + lane;
++                out[i]      = s_shard[r];
++            }
++        }
++    }
++}
++
++template <int S_v, bool KDA>
++static void gdn_materialize_launch(dpct::queue_ptr stream, const sycl::nd_range<3> & range, const float * base,
++                                   const float * stash, float * planes, int64_t slot_stride, int64_t H, int n_prev,
++                                   int K) {
++    stream->parallel_for(range, [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
++        gdn_materialize_sycl<S_v, KDA>(base, stash, planes, slot_stride, H, n_prev, K);
++    });
++}
++
++bool ggml_sycl_gdn_materialize(dpct::queue_ptr stream, int64_t S_v, int64_t H, bool kda, const float * base,
++                               const float * stash, float * planes, int64_t slot_stride, int n_prev, int K) {
++    const int warp_size = ggml_sycl_info().devices[ggml_sycl_get_device()].warp_size;
++    const int num_warps = 4;
++    dpct::dim3 grid_dims(H, 1, (S_v + num_warps - 1) / num_warps);
++    dpct::dim3 block_dims(warp_size <= S_v ? warp_size : S_v, num_warps, 1);
++    const sycl::nd_range<3> range(grid_dims * block_dims, block_dims);
++#define GDN_MAT(SV)                                                                                         \
++    case SV:                                                                                                \
++        if (kda) {                                                                                          \
++            gdn_materialize_launch<SV, true>(stream, range, base, stash, planes, slot_stride, H, n_prev, K);  \
++        } else {                                                                                            \
++            gdn_materialize_launch<SV, false>(stream, range, base, stash, planes, slot_stride, H, n_prev, K); \
++        }                                                                                                   \
++        return true;
++    switch (S_v) {
++        GDN_MAT(16)
++        GDN_MAT(32)
++        GDN_MAT(64)
++        GDN_MAT(128)
++        default:
++            return false;
++    }
++#undef GDN_MAT
++}
 diff --git a/ggml/src/ggml-sycl/gated_delta_net.hpp b/ggml/src/ggml-sycl/gated_delta_net.hpp
-index 7903b8e06..e5dfb1196 100644
+index 7903b8e06..e456bccad 100644
 --- a/ggml/src/ggml-sycl/gated_delta_net.hpp
 +++ b/ggml/src/ggml-sycl/gated_delta_net.hpp
-@@ -11,9 +11,22 @@ struct ggml_sycl_gated_delta_net_fused_cache {
+@@ -11,9 +11,40 @@ struct ggml_sycl_gated_delta_net_fused_cache {
      int64_t slot_stride; // between rollback slots (0 when K==1)
  };
  
@@ -955,6 +1280,24 @@ index 7903b8e06..e5dfb1196 100644
 +void ggml_sycl_op_gated_delta_net_ex(ggml_backend_sycl_context & ctx, ggml_tensor * dst,
 +                                     const ggml_sycl_gated_delta_net_fused_cache *  cache,
 +                                     const ggml_sycl_gated_delta_net_direct_state * direct);
++
++// GGML_SYCL_GDN_LAZY: the kernel keeps the state before the step (base) plus the update terms of the step's tokens
++// (stash) instead of one state snapshot per token; see gdn_lazy_args in gated_delta_net.cpp. One sequence only.
++struct ggml_sycl_gated_delta_net_lazy {
++    const float * base_in;
++    float *       base_out;
++    const float * stash_prev;
++    float *       stash_new;
++    int           n_replay;
++    bool          write_base;
++};
++
++void ggml_sycl_op_gated_delta_net_lazy(ggml_backend_sycl_context & ctx, ggml_tensor * dst,
++                                       const ggml_sycl_gated_delta_net_lazy & lazy);
++
++// writes the snapshots a lazy cell stands for (slot s = state s tokens before the end of the stashed step)
++bool ggml_sycl_gdn_materialize(dpct::queue_ptr stream, int64_t S_v, int64_t H, bool kda, const float * base,
++                               const float * stash, float * planes, int64_t slot_stride, int n_prev, int K);
 diff --git a/ggml/src/ggml-sycl/gemm.hpp b/ggml/src/ggml-sycl/gemm.hpp
 index 81bc5c2e6..a81077ca4 100644
 --- a/ggml/src/ggml-sycl/gemm.hpp
@@ -979,7 +1322,7 @@ index 81bc5c2e6..a81077ca4 100644
          auto a_mem = dnnl::memory(a_in_md, eng, const_cast<void*>(a));
          auto b_mem = dnnl::memory(b_in_md, eng, const_cast<void*>(b));
 diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
-index ed0b27280..0ba5d3dbb 100644
+index ed0b27280..d7677ff59 100644
 --- a/ggml/src/ggml-sycl/ggml-sycl.cpp
 +++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
 @@ -25,6 +25,10 @@
@@ -993,7 +1336,166 @@ index ed0b27280..0ba5d3dbb 100644
  #include <cmath>
  #include <cstring>
  #include <iostream>
-@@ -5273,6 +5277,15 @@ static bool can_use_mul_mat_q(const ggml_tensor * src0, const ggml_tensor * src1
+@@ -770,10 +774,117 @@ static bool ggml_backend_buffer_is_sycl(ggml_backend_buffer_t buffer) {
+     return buffer->buft->iface.get_name == ggml_backend_sycl_buffer_type_get_name;
+ }
+ 
++// ---- GGML_SYCL_GDN_LAZY: recurrent-state snapshots kept as update terms ----
++// With rollback snapshots (K slots) a GATED_DELTA_NET of n tokens writes n copies of its state (3 MB each for
++// Qwen3.8, 36 layers) on every MTP verify step. With this switch a state cache cell is kept "lazy" instead:
++// slot 0 holds the state before the last step (base) and a small stash holds k, delta and exp(g) of that step's
++// tokens. The next step replays the tokens that were kept (the rollback index tells how many), so a step writes
++// one state copy per layer whatever its token count. The values are the ones the token loop computes.
++// Every other access to the cache memory (tensor get/set/copy/memset, buffer clear, a graph node other than the
++// lazy kernel) first turns the cell back into snapshots (materialize).
++//   =1 on (needs GGML_SYCL_GDN_STATE_DIRECT=1); =2 self-check against the snapshot kernel on a shadow cache.
++static int ggml_sycl_gdn_lazy_mode() {
++    static const int mode = getenv("GGML_SYCL_GDN_LAZY") ? atoi(getenv("GGML_SYCL_GDN_LAZY")) : 0;
++    return mode;
++}
++
++constexpr int GGML_SYCL_GDN_LAZY_CAP = 8;   // tokens a stash holds
++
++struct ggml_sycl_gdn_lazy_rec {
++    const char * c0 = nullptr;     // the state cache tensor [D, mem_size * K]
++    const char * c1 = nullptr;
++    queue_ptr    stream = nullptr;
++    float *      stash[2] = { nullptr, nullptr };
++    float *      shadow = nullptr; // =2: K snapshot slots of the cell as the snapshot kernel keeps them
++    bool         shadow_valid = false;
++    int64_t      S_v = 0, H = 0, D = 0, mem_size = 0;
++    bool         kda = false;
++    int          K = 0;
++    int          cur = 0;          // stash[cur] belongs to the lazy cell
++    bool         lazy = false;
++    int64_t      cell = 0;
++    int          n_prev = 0;
++    bool         foreign = false;  // this graph compute has another node on the cache
++    int64_t      row = -1;         // this graph compute: the state row the kernel was asked to read
++};
++
++static std::vector<ggml_sycl_gdn_lazy_rec> g_ggml_sycl_gdn_lazy;
++static int                                 g_ggml_sycl_gdn_lazy_n = 0;   // cells that are lazy now
++static uint64_t                            g_ggml_sycl_gdn_lazy_stat[4]; // lazy steps, materialized, checked, differ
++// why cells were materialized: 0 tensor access, 1 other graph node, 2 kernel not applicable (tokens, shapes),
++// 3 other cell or geometry, 4 rollback beyond the last step
++static uint64_t                            g_ggml_sycl_gdn_lazy_why[5];
++static int                                 g_ggml_sycl_gdn_lazy_reason = 0;
++
++static void ggml_sycl_gdn_lazy_check_planes(ggml_sycl_gdn_lazy_rec & r);
++
++static void ggml_sycl_gdn_lazy_materialize(ggml_sycl_gdn_lazy_rec & r, bool wait) {
++    if (!r.lazy) {
++        return;
++    }
++    float * base = (float *) const_cast<char *>(r.c0) + r.cell * r.D;
++    GGML_ASSERT(ggml_sycl_gdn_materialize(r.stream, r.S_v, r.H, r.kda, base, r.stash[r.cur], base, r.mem_size * r.D,
++                                          r.n_prev, r.K));
++    r.lazy = false;
++    g_ggml_sycl_gdn_lazy_n--;
++    g_ggml_sycl_gdn_lazy_stat[1]++;
++    g_ggml_sycl_gdn_lazy_why[g_ggml_sycl_gdn_lazy_reason]++;
++    if (ggml_sycl_gdn_lazy_mode() == 2) {
++        ggml_sycl_gdn_lazy_check_planes(r);
++    }
++    r.shadow_valid = false;
++    if (wait) {
++        r.stream->wait();
++    }
++}
++
++// before a read or write of [p, p + size) that does not come from the lazy kernel
++static void ggml_sycl_gdn_lazy_touch(const void * p, size_t size) {
++    if (g_ggml_sycl_gdn_lazy_n == 0 || p == nullptr || size == 0) {
++        return;
++    }
++    const char * p0 = (const char *) p;
++    const char * p1 = p0 + size;
++    for (auto & r : g_ggml_sycl_gdn_lazy) {
++        if (r.lazy && p0 < r.c1 && p1 > r.c0) {
++            g_ggml_sycl_gdn_lazy_reason = 0;
++            ggml_sycl_gdn_lazy_materialize(r, true);
++        }
++    }
++}
++
++// the memory [p, p + size) is cleared or freed: nothing to keep
++static void ggml_sycl_gdn_lazy_drop(const void * p, size_t size, bool freed) {
++    const char * p0 = (const char *) p;
++    const char * p1 = p0 + size;
++    for (size_t i = 0; i < g_ggml_sycl_gdn_lazy.size();) {
++        auto & r = g_ggml_sycl_gdn_lazy[i];
++        if (p0 < r.c1 && p1 > r.c0) {
++            if (r.lazy) {
++                r.lazy = false;
++                g_ggml_sycl_gdn_lazy_n--;
++            }
++            r.shadow_valid = false;
++            if (freed) {
++                r.stream->wait();
++                for (float * s : { r.stash[0], r.stash[1], r.shadow }) {
++                    if (s != nullptr) {
++                        sycl::free(s, *r.stream);
++                    }
++                }
++                g_ggml_sycl_gdn_lazy.erase(g_ggml_sycl_gdn_lazy.begin() + i);
++                continue;
++            }
++        }
++        i++;
++    }
++}
++
+ static void
+ ggml_backend_sycl_buffer_free_buffer(ggml_backend_buffer_t buffer) try {
+     ggml_backend_sycl_buffer_context * ctx = ( ggml_backend_sycl_buffer_context *)buffer->context;
+     ggml_sycl_set_device(ctx->device);
++    ggml_sycl_gdn_lazy_drop(ctx->dev_ptr, buffer->size, true);
+ 
+     delete ctx;
+ }
+@@ -851,6 +962,7 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
+     GGML_SYCL_DEBUG(" size=%zu offset=%zu\n", size, offset);
+     ggml_backend_sycl_buffer_context * ctx = ( ggml_backend_sycl_buffer_context *)buffer->context;
+     ggml_sycl_set_device(ctx->device);
++    ggml_sycl_gdn_lazy_touch((const char *) tensor->data + offset, size);
+ 
+     // copy through pinned memory so the device never reads mmap()ed pages directly
+     // chunks pipeline on the in-order compute queue, so no drain per tensor is needed
+@@ -914,6 +1026,7 @@ static void ggml_backend_sycl_buffer_get_tensor(ggml_backend_buffer_t buffer,
+     ggml_backend_sycl_buffer_context * ctx = ( ggml_backend_sycl_buffer_context *)buffer->context;
+ 
+     ggml_sycl_set_device(ctx->device);
++    ggml_sycl_gdn_lazy_touch((const char *) tensor->data + offset, size);
+     auto stream = dpct::dev_mgr::instance().get_device(ctx->device).default_queue();
+ 
+     SYCL_CHECK(CHECK_TRY_ERROR(
+@@ -1004,6 +1117,8 @@ ggml_backend_sycl_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
+         ggml_backend_sycl_buffer_context * dst_ctx = (ggml_backend_sycl_buffer_context *)dst->buffer->context;
+ 
+         ggml_sycl_set_device(src_ctx->device);
++        ggml_sycl_gdn_lazy_touch(src->data, ggml_nbytes(src));
++        ggml_sycl_gdn_lazy_touch(dst->data, ggml_nbytes(dst));
+         /*
+         DPCT1009:198: SYCL uses exceptions to report errors and does not use the
+         error codes. The original code was commented out and a warning string
+@@ -1063,6 +1178,7 @@ static void ggml_backend_sycl_buffer_clear(ggml_backend_buffer_t buffer,
+     queue_ptr stream = ctx->stream;
+     SYCL_CHECK(
+         CHECK_TRY_ERROR(dpct::get_current_device().queues_wait_and_throw()));
++    ggml_sycl_gdn_lazy_drop(ctx->dev_ptr, buffer->size, false);
+ 
+     constexpr size_t MAX_CHUNK = 2ULL << 30;  // 2 GiB
+     for (size_t off = 0; off < buffer->size; off += MAX_CHUNK) {
+@@ -1095,6 +1211,7 @@ static void ggml_backend_sycl_buffer_memset_tensor(ggml_backend_buffer_t buffer,
+         GGML_ABORT("Error: Tensor data pointer is null.\n");
+     }
+     void * target_ptr = static_cast<char *>(tensor->data) + offset;
++    ggml_sycl_gdn_lazy_touch(target_ptr, size);
+     SYCL_CHECK(CHECK_TRY_ERROR((*stream).memset(target_ptr, value, size)));
+     SYCL_CHECK(CHECK_TRY_ERROR((*stream).wait()));
+ }
+@@ -5273,6 +5390,15 @@ static bool can_use_mul_mat_q(const ggml_tensor * src0, const ggml_tensor * src1
      return src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
  }
  
@@ -1009,7 +1511,7 @@ index ed0b27280..0ba5d3dbb 100644
  static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
      scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2);
  
-@@ -5340,6 +5353,14 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
+@@ -5340,6 +5466,14 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
          use_dequantize_mul_mat_vec = use_dequantize_mul_mat_vec && use;
      }
  
@@ -1024,7 +1526,7 @@ index ed0b27280..0ba5d3dbb 100644
      if (!split && src0->type == GGML_TYPE_F16 && ggml_is_permuted(src0) && ggml_is_permuted(src1) && src1->ne[1] == 1) {
          // TODO: Refactor and cleanup of mul mat dispatching.
          if (src0->ne[3] == 1 && src1->ne[3] == 1) {
-@@ -5701,6 +5722,15 @@ __dpct_inline__ static void k_copy_dst_from_contiguous(
+@@ -5701,6 +5835,15 @@ __dpct_inline__ static void k_copy_dst_from_contiguous(
  }
  
  // returns true when ggml_sycl_mul_mat_id takes the fallback path that requires stream synchronization
@@ -1040,7 +1542,7 @@ index ed0b27280..0ba5d3dbb 100644
  static bool ggml_sycl_mul_mat_id_needs_sync(const ggml_tensor * dst) {
      const ggml_tensor * src0 = dst->src[0];
      const ggml_tensor * src1 = dst->src[1];
-@@ -5710,13 +5740,16 @@ static bool ggml_sycl_mul_mat_id_needs_sync(const ggml_tensor * dst) {
+@@ -5710,13 +5853,16 @@ static bool ggml_sycl_mul_mat_id_needs_sync(const ggml_tensor * dst) {
      const int64_t ne11 = src1->ne[1];
      const int64_t ne12 = src1->ne[2];
  
@@ -1060,7 +1562,7 @@ index ed0b27280..0ba5d3dbb 100644
      if (ne11 != 1 && ne11 != n_ids_per_group) return true;
  
      return !ggml_sycl_supports_mmvq_id(src0->type);
-@@ -5745,11 +5778,15 @@ static bool ggml_sycl_mul_mat_id_mmvq_fused(
+@@ -5745,11 +5891,15 @@ static bool ggml_sycl_mul_mat_id_mmvq_fused(
      const ggml_tensor_extra_gpu * src0_extra =
          static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
      const bool use_reorder = src0_extra && src0_extra->optimized_feature.reorder;
@@ -1077,7 +1579,7 @@ index ed0b27280..0ba5d3dbb 100644
          quantize_row_q8_1_sycl<quantize_and_reorder_q8_1_soa>(
              (const float *) src1->data, src1_ddq, (int) ne10, (int) ne11,
              src1_padded_cols, stream);
-@@ -5762,6 +5799,15 @@ static bool ggml_sycl_mul_mat_id_mmvq_fused(
+@@ -5762,6 +5912,15 @@ static bool ggml_sycl_mul_mat_id_mmvq_fused(
      const size_t bytes_per_qrow = (size_t) src1_padded_cols * sizeof(block_q8_1) / QK8_1;
      const size_t src1_row_stride = (ne11 == 1) ? 0 : bytes_per_qrow;
  
@@ -1093,7 +1595,7 @@ index ed0b27280..0ba5d3dbb 100644
      if (use_reorder) {
          return ggml_sycl_mul_mat_vec_q_id_reorder(
              src0->type, src0->data, src1_ddq, (const int32_t *) ids->data,
-@@ -5778,6 +5824,74 @@ static bool ggml_sycl_mul_mat_id_mmvq_fused(
+@@ -5778,6 +5937,74 @@ static bool ggml_sycl_mul_mat_id_mmvq_fused(
          src1_row_stride, stream);
  }
  
@@ -1168,7 +1670,7 @@ index ed0b27280..0ba5d3dbb 100644
  // counting sort of the routed rows by expert id (row_id_i, as chosen by the router):
  // builds a projection of a memory layout where each expert's slice is contiguous
  static void mmid_counting_sort_rows(
-@@ -5819,6 +5933,89 @@ static void mmid_counting_sort_rows(
+@@ -5819,6 +6046,89 @@ static void mmid_counting_sort_rows(
      }
  }
  
@@ -1258,7 +1760,7 @@ index ed0b27280..0ba5d3dbb 100644
  static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
                                   ggml_tensor *dst) try {
      scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/3);
-@@ -5839,6 +6036,76 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
+@@ -5839,6 +6149,76 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
              return;
          }
      }
@@ -1335,7 +1837,7 @@ index ed0b27280..0ba5d3dbb 100644
      GGML_ASSERT(ggml_sycl_mul_mat_id_needs_sync(dst));
  
      // The per-expert loop below reads the experts in whatever layout they have: reorder MXFP4 here as well, so prompt processing does not depend on a single-token decode having run first.
-@@ -6111,6 +6378,108 @@ catch (sycl::exception const &exc) {
+@@ -6111,6 +6491,108 @@ catch (sycl::exception const &exc) {
    std::exit(1);
  }
  
@@ -1444,7 +1946,7 @@ index ed0b27280..0ba5d3dbb 100644
  static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct ggml_tensor * dst) try {
      GGML_SYCL_DEBUG("[SYCL] ggml_sycl_compute_forward: dst=%s, op=%s\n", dst->name, ggml_op_name(dst->op));
      if (!g_sycl_loaded) return false;
-@@ -6426,6 +6795,9 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
+@@ -6426,6 +6908,9 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
          case GGML_OP_TOP_K:
              ggml_sycl_op_top_k(ctx, dst);
              break;
@@ -1454,7 +1956,7 @@ index ed0b27280..0ba5d3dbb 100644
          case GGML_OP_TIMESTEP_EMBEDDING:
              ggml_sycl_op_timestep_embedding(ctx, dst);
              break;
-@@ -6710,7 +7082,656 @@ static int ggml_sycl_try_gdn_cache_fusion(const ggml_cgraph * cgraph, int node_i
+@@ -6710,7 +7195,968 @@ static int ggml_sycl_try_gdn_cache_fusion(const ggml_cgraph * cgraph, int node_i
      return skip;
  }
  
@@ -2054,7 +2556,7 @@ index ed0b27280..0ba5d3dbb 100644
 +    if (ggml_sycl_gdn_state_direct_mode() == 0 || cgraph->n_nodes < 8) {
 +        return nullptr;
 +    }
-+    static std::vector<ggml_sycl_gdn_direct_plan> plans(16);
++    static std::vector<ggml_sycl_gdn_direct_plan> plans(48);
 +    static size_t next = 0;
 +    static uint64_t built = 0;
 +    const int n_nodes = cgraph->n_nodes;
@@ -2105,13 +2607,325 @@ index ed0b27280..0ba5d3dbb 100644
 +    }
 +}
 +
++// ---- GGML_SYCL_GDN_LAZY, graph side (see ggml_sycl_gdn_lazy_mode) ----
++static ggml_sycl_gdn_lazy_rec * ggml_sycl_gdn_lazy_find(const void * cache) {
++    for (auto & r : g_ggml_sycl_gdn_lazy) {
++        if (r.c0 == (const char *) cache) {
++            return &r;
++        }
++    }
++    return nullptr;
++}
++
++static void ggml_sycl_gdn_lazy_report(bool force) {
++    const uint64_t n = g_ggml_sycl_gdn_lazy_stat[0];
++    if (force || (n & (n - 1)) == 0 || n % 36000 == 0) {
++        fprintf(stderr, "[SYCL-GDN-LAZY] %llu lazy kernel runs, %llu cells materialized (access %llu, graph node %llu, "
++                "kernel n/a %llu, cell %llu, rollback %llu), %llu checks, %llu differ\n",
++                (unsigned long long) n, (unsigned long long) g_ggml_sycl_gdn_lazy_stat[1],
++                (unsigned long long) g_ggml_sycl_gdn_lazy_why[0], (unsigned long long) g_ggml_sycl_gdn_lazy_why[1],
++                (unsigned long long) g_ggml_sycl_gdn_lazy_why[2], (unsigned long long) g_ggml_sycl_gdn_lazy_why[3],
++                (unsigned long long) g_ggml_sycl_gdn_lazy_why[4],
++                (unsigned long long) g_ggml_sycl_gdn_lazy_stat[2], (unsigned long long) g_ggml_sycl_gdn_lazy_stat[3]);
++    }
++}
++
++// =2: after a materialize the cell's snapshot slots must equal the shadow slots of the snapshot kernel
++static void ggml_sycl_gdn_lazy_check_planes(ggml_sycl_gdn_lazy_rec & r) {
++    if (!r.shadow_valid || r.shadow == nullptr) {
++        return;
++    }
++    r.stream->wait();
++    const size_t       bytes = (size_t) r.D * sizeof(float);
++    std::vector<float> a(r.D), b(r.D);
++    const int          n = std::min(r.n_prev, r.K);
++    for (int s = 0; s < n; s++) {
++        r.stream->memcpy(a.data(), (const float *) r.c0 + (r.cell + (int64_t) s * r.mem_size) * r.D, bytes).wait();
++        r.stream->memcpy(b.data(), r.shadow + (int64_t) s * r.D, bytes).wait();
++        g_ggml_sycl_gdn_lazy_stat[2]++;
++        if (memcmp(a.data(), b.data(), bytes) != 0) {
++            float md = 0.0f;
++            for (int64_t e = 0; e < r.D; e++) {
++                md = std::max(md, std::fabs(a[e] - b[e]));
++            }
++            if (g_ggml_sycl_gdn_lazy_stat[3]++ < 10) {
++                fprintf(stderr, "[SYCL-GDN-LAZY] materialized slot %d of %d differs from the snapshot kernel, max abs diff %g\n",
++                        s, n, (double) md);
++            }
++        }
++    }
++}
++
++// Start of a graph compute: make records for the caches of the direct gathers, find caches that other nodes of
++// this graph touch (those cells are materialized now and stay with the snapshot kernel for this compute), and
++// read the state row ids.
++static void ggml_sycl_gdn_lazy_begin(ggml_backend_sycl_context & ctx, const ggml_cgraph * cgraph,
++                                     const ggml_sycl_gdn_direct_plan * plan) {
++    const bool enable = plan != nullptr && ggml_sycl_gdn_lazy_mode() != 0 && ggml_sycl_gdn_state_direct_mode() == 1;
++    const int  n_nodes = cgraph->n_nodes;
++    if (enable) {
++        for (int i = 0; i < n_nodes; i++) {
++            if (plan->rows_of[i] < 0) {
++                continue;
++            }
++            const ggml_tensor * cache = cgraph->nodes[plan->rows_of[i]]->src[0];
++            if (ggml_sycl_gdn_lazy_find(cache->data) == nullptr) {
++                ggml_sycl_gdn_lazy_rec r;
++                r.c0     = (const char *) cache->data;
++                r.c1     = r.c0 + ggml_nbytes(cache);
++                r.stream = ctx.stream();
++                g_ggml_sycl_gdn_lazy.push_back(r);
++            }
++        }
++    }
++    if (g_ggml_sycl_gdn_lazy.empty()) {
++        return;
++    }
++    const char * lo = g_ggml_sycl_gdn_lazy[0].c0;
++    const char * hi = g_ggml_sycl_gdn_lazy[0].c1;
++    for (auto & r : g_ggml_sycl_gdn_lazy) {
++        r.foreign = false;
++        r.row     = -1;
++        lo        = std::min(lo, r.c0);
++        hi        = std::max(hi, r.c1);
++    }
++    const auto touch = [&](const ggml_tensor * x) {
++        if (x == nullptr || x->data == nullptr) {
++            return;
++        }
++        const char * p0 = (const char *) x->data;
++        if (p0 >= hi) {
++            return;
++        }
++        const char * p1 = p0 + ggml_nbytes(x);
++        if (p1 <= lo) {
++            return;
++        }
++        for (auto & r : g_ggml_sycl_gdn_lazy) {
++            if (p0 < r.c1 && p1 > r.c0) {
++                r.foreign = true;
++            }
++        }
++    };
++    const bool direct = plan != nullptr && ggml_sycl_gdn_state_direct_mode() == 1;
++    int        owned_until = -1;   // the cpy nodes that the cache fusion of a gated_delta_net takes
++    for (int i = 0; i < n_nodes; i++) {
++        const ggml_tensor * n = cgraph->nodes[i];
++        if (ggml_sycl_is_view_or_noop(n) || (n->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || i <= owned_until) {
++            continue;
++        }
++        if (direct && plan->gdn_of[i] >= 0) {
++            continue;   // a state gather that its gated_delta_net reads directly
++        }
++        if (direct && n->op == GGML_OP_GATED_DELTA_NET && plan->rows_of[i] >= 0) {
++            ggml_sycl_gated_delta_net_fused_cache fc;
++            const int skip = ggml_sycl_try_gdn_cache_fusion(cgraph, i, fc);
++            if (skip > 0) {
++                owned_until = i + skip;
++                continue;   // reads compute buffers, its snapshots go to the cache through the fusion
++            }
++        }
++        touch(n);
++        for (int s = 0; s < GGML_MAX_SRC; s++) {
++            touch(n->src[s]);
++        }
++    }
++    for (auto & r : g_ggml_sycl_gdn_lazy) {
++        if (r.foreign) {
++            g_ggml_sycl_gdn_lazy_reason = 1;
++            ggml_sycl_gdn_lazy_materialize(r, false);
++        }
++    }
++    if (!enable) {
++        return;
++    }
++    // the row ids are graph inputs, written before the compute; read them in one wait
++    static std::vector<int32_t> vals;
++    static std::vector<ggml_sycl_gdn_lazy_rec *> recs;
++    vals.clear();
++    recs.clear();
++    for (int i = 0; i < n_nodes; i++) {
++        if (plan->rows_of[i] < 0) {
++            continue;
++        }
++        const ggml_tensor * rows = cgraph->nodes[plan->rows_of[i]];
++        ggml_sycl_gdn_lazy_rec * r = ggml_sycl_gdn_lazy_find(rows->src[0]->data);
++        if (r != nullptr && !r->foreign && ggml_nelements(rows->src[1]) == 1) {
++            recs.push_back(r);
++        }
++    }
++    if (recs.empty()) {
++        return;
++    }
++    vals.assign(recs.size(), -1);
++    dpct::queue_ptr q = ctx.stream();
++    size_t k = 0;
++    for (int i = 0; i < n_nodes && k < recs.size(); i++) {
++        if (plan->rows_of[i] < 0) {
++            continue;
++        }
++        const ggml_tensor * rows = cgraph->nodes[plan->rows_of[i]];
++        if (recs[k]->c0 != (const char *) rows->src[0]->data) {
++            continue;
++        }
++        q->memcpy(&vals[k], rows->src[1]->data, sizeof(int32_t));
++        k++;
++    }
++    q->wait();
++    for (size_t j = 0; j < recs.size(); j++) {
++        recs[j]->row = vals[j];
++    }
++}
++
++// A GATED_DELTA_NET whose state gather is read directly. Returns the number of following nodes to skip when the
++// lazy kernel ran, -1 when the node is left to the snapshot kernel (the cell is materialized first).
++static int ggml_sycl_gdn_lazy_dispatch(ggml_backend_sycl_context & ctx, const ggml_cgraph * cgraph, int i,
++                                       const ggml_tensor * rows) {
++    ggml_tensor *            node  = cgraph->nodes[i];
++    const ggml_tensor *      cache = rows->src[0];
++    ggml_sycl_gdn_lazy_rec * r     = ggml_sycl_gdn_lazy_find(cache->data);
++    if (r == nullptr) {
++        return -1;
++    }
++    const ggml_tensor * v        = node->src[2];
++    const int64_t       S_v      = v->ne[0];
++    const int64_t       H        = v->ne[1];
++    const int64_t       n_tokens = v->ne[2];
++    const int64_t       n_seqs   = v->ne[3];
++    const int64_t       D        = S_v * S_v * H;
++    const int           K        = ggml_get_op_params_i32(node, 0);
++    const bool          kda      = node->src[3]->ne[0] == S_v;
++
++    ggml_sycl_gated_delta_net_fused_cache fc;
++    const int skip = ggml_sycl_try_gdn_cache_fusion(cgraph, i, fc);
++    bool ok = !r->foreign && skip > 0 && n_seqs == 1 && K > 1 && n_tokens >= 1 && n_tokens <= GGML_SYCL_GDN_LAZY_CAP &&
++              r->row >= 0 && (S_v == 16 || S_v == 32 || S_v == 64 || S_v == 128) &&
++              (int64_t) (cache->nb[1] / sizeof(float)) == D && fc.slot_stride > 0 && fc.slot_stride % D == 0 &&
++              (const char *) fc.data >= r->c0 && (const char *) fc.data < r->c1 &&
++              ((const char *) fc.data - r->c0) % (D * (int64_t) sizeof(float)) == 0;
++    int64_t mem_size = 0, c_out = 0;
++    if (ok) {
++        mem_size = fc.slot_stride / D;
++        c_out    = (fc.data - (const float *) r->c0) / D;
++        ok       = c_out < mem_size && r->row < mem_size * K;
++    }
++    if (!ok) {
++        if (r->lazy && g_ggml_sycl_gdn_lazy_why[2] < 3) {
++            fprintf(stderr, "[SYCL-GDN-LAZY] snapshot kernel: foreign %d, fusion skip %d, seqs %lld, K %d, tokens %lld, row %lld\n",
++                    (int) r->foreign, skip, (long long) n_seqs, K, (long long) n_tokens, (long long) r->row);
++        }
++        g_ggml_sycl_gdn_lazy_reason = 2;
++        ggml_sycl_gdn_lazy_materialize(*r, false);
++        return -1;
++    }
++    const int64_t R    = r->row;
++    const int64_t p    = R / mem_size;   // rollback index: the state p tokens before the end of the last step
++    const int64_t c_in = R % mem_size;
++    if (r->lazy && (r->S_v != S_v || r->H != H || r->mem_size != mem_size || r->kda != kda || r->K != K ||
++                    r->cell != c_in || c_in != c_out || p > r->n_prev)) {
++        if (r->cell == c_in && p > r->n_prev) {
++            static bool warned = false;
++            if (!warned) {
++                warned = true;
++                fprintf(stderr, "[SYCL-GDN-LAZY] rollback of %lld tokens after a step of %d tokens\n", (long long) p, r->n_prev);
++            }
++        }
++        g_ggml_sycl_gdn_lazy_reason = (r->cell == c_in && c_in == c_out && p > r->n_prev) ? 4 : 3;
++        ggml_sycl_gdn_lazy_materialize(*r, false);
++    }
++    dpct::queue_ptr q        = ctx.stream();
++    const size_t    stash_n  = (size_t) GGML_SYCL_GDN_LAZY_CAP * 3 * H * S_v;
++    if (r->stash[0] == nullptr || r->S_v != S_v || r->H != H) {
++        for (float *& s : r->stash) {
++            if (s != nullptr) {
++                q->wait();
++                sycl::free(s, *q);
++            }
++            s = sycl::malloc_device<float>(stash_n, *q);
++            GGML_ASSERT(s != nullptr);
++        }
++    }
++    r->S_v = S_v; r->H = H; r->D = D; r->mem_size = mem_size; r->kda = kda; r->K = K; r->stream = q;
++
++    float * cache_f = (float *) const_cast<char *>(r->c0);
++    ggml_sycl_gated_delta_net_lazy la;
++    la.stash_prev = r->stash[r->cur];
++    la.stash_new  = r->stash[r->cur ^ 1];
++    la.base_out   = cache_f + c_out * D;
++    if (r->lazy) {
++        la.base_in    = la.base_out;
++        la.n_replay   = r->n_prev - (int) p;
++        la.write_base = la.n_replay > 0;
++    } else {
++        la.base_in    = cache_f + R * D;
++        la.n_replay   = 0;
++        la.write_base = R != c_out;
++    }
++
++    const bool   check     = ggml_sycl_gdn_lazy_mode() == 2;
++    const size_t attn_size = (size_t) S_v * H * n_tokens * sizeof(float);
++    static std::vector<char> ref, got;
++    if (check) {
++        if (r->shadow == nullptr) {
++            r->shadow = sycl::malloc_device<float>((size_t) K * D, *q);
++            GGML_ASSERT(r->shadow != nullptr);
++        }
++        // the snapshot kernel on the shadow slots (or, entering, on the cache row), same inputs
++        ggml_sycl_gated_delta_net_fused_cache  sfc = { r->shadow, D };
++        ggml_sycl_gated_delta_net_direct_state sds;
++        if (r->lazy && r->shadow_valid) {
++            sds = { r->shadow + p * D, (const int32_t *) rows->src[1]->data, 0 };
++        } else {
++            sds = { cache_f, (const int32_t *) rows->src[1]->data, D };
++        }
++        ggml_sycl_op_gated_delta_net_ex(ctx, node, &sfc, &sds);
++        ref.resize(attn_size);
++        q->memcpy(ref.data(), node->data, attn_size).wait();
++    }
++
++    ggml_sycl_op_gated_delta_net_lazy(ctx, node, la);
++
++    if (!r->lazy) {
++        r->lazy = true;
++        g_ggml_sycl_gdn_lazy_n++;
++    }
++    r->cell   = c_out;
++    r->n_prev = (int) n_tokens;
++    r->cur   ^= 1;
++    g_ggml_sycl_gdn_lazy_stat[0]++;
++    if (check) {
++        got.resize(attn_size);
++        q->memcpy(got.data(), node->data, attn_size).wait();
++        r->shadow_valid = true;
++        g_ggml_sycl_gdn_lazy_stat[2]++;
++        if (memcmp(ref.data(), got.data(), attn_size) != 0) {
++            const float * a  = (const float *) ref.data();
++            const float * b  = (const float *) got.data();
++            float         md = 0.0f;
++            for (size_t e = 0; e < attn_size / sizeof(float); e++) {
++                md = std::max(md, std::fabs(a[e] - b[e]));
++            }
++            if (g_ggml_sycl_gdn_lazy_stat[3]++ < 10) {
++                fprintf(stderr, "[SYCL-GDN-LAZY] attention differs from the snapshot kernel: %lld tokens, replay %d, max abs diff %g\n",
++                        (long long) n_tokens, la.n_replay, (double) md);
++            }
++        }
++    }
++    ggml_sycl_gdn_lazy_report(false);
++    return skip;
++}
++
  static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
 +    const ggml_sycl_gdn_direct_plan * gdn_direct      = ggml_sycl_gdn_direct_get(cgraph);
 +    const int                         gdn_direct_mode = ggml_sycl_gdn_state_direct_mode();
++    const bool gdn_lazy = ggml_sycl_gdn_lazy_mode() != 0 && gdn_direct != nullptr && gdn_direct_mode == 1;
++    if (ggml_sycl_gdn_lazy_mode() != 0 || !g_ggml_sycl_gdn_lazy.empty()) {
++        ggml_sycl_gdn_lazy_begin(*sycl_ctx, cgraph, gdn_direct);
++    }
      for (int i = 0; i < cgraph->n_nodes; i++) {
          ggml_tensor * node = cgraph->nodes[i];
          if (ggml_sycl_is_view_or_noop(node)) {
-@@ -6719,12 +7740,30 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
+@@ -6719,12 +8165,30 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
          if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
              continue;
          }
@@ -2142,10 +2956,17 @@ index ed0b27280..0ba5d3dbb 100644
  #ifndef NDEBUG
          assert(node->buffer->buft == ggml_backend_sycl_buffer_type(sycl_ctx->device));
          for (int j = 0; j < GGML_MAX_SRC; j++) {
-@@ -6735,13 +7774,29 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
+@@ -6735,13 +8199,36 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
  #endif
          // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
          if (node->op == GGML_OP_GATED_DELTA_NET) {
++            if (gdn_lazy && gdn_direct->rows_of[i] >= 0) {
++                const int lazy_skip = ggml_sycl_gdn_lazy_dispatch(*sycl_ctx, cgraph, i, cgraph->nodes[gdn_direct->rows_of[i]]);
++                if (lazy_skip >= 0) {
++                    i += lazy_skip;
++                    continue;
++                }
++            }
 +            ggml_sycl_gated_delta_net_direct_state         direct_state;
 +            const ggml_sycl_gated_delta_net_direct_state * direct = nullptr;
 +            if (gdn_direct != nullptr && gdn_direct->rows_of[i] >= 0) {
@@ -2173,7 +2994,7 @@ index ed0b27280..0ba5d3dbb 100644
          }
          if (node->op == GGML_OP_RMS_NORM &&
              ggml_sycl_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD }, {})) {
-@@ -6902,6 +7957,9 @@ static bool mul_mat_uses_onednn(int device, ggml_tensor * dst) {
+@@ -6902,6 +8389,9 @@ static bool mul_mat_uses_onednn(int device, ggml_tensor * dst) {
      // the branch order below follows ggml_sycl_op_mul_mat_sycl(); graphs are single device only, so
      // row_diff == src0->ne[1] and src1_ncols == src1->ne[1] there
  #if defined(GGML_SYCL_HAS_BF16)
@@ -2183,7 +3004,7 @@ index ed0b27280..0ba5d3dbb 100644
      if (src0->type == GGML_TYPE_BF16 && ggml_is_contiguous(src0)) {
          return true;
      }
-@@ -7093,7 +8151,57 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
+@@ -7093,7 +8583,57 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
          }
      } else
  #endif
@@ -2242,7 +3063,7 @@ index ed0b27280..0ba5d3dbb 100644
          ggml_backend_sycl_graph_compute_impl(sycl_ctx, cgraph);
      }
      return GGML_STATUS_SUCCESS;
-@@ -7630,6 +8738,9 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
+@@ -7630,6 +9170,9 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
                  ggml_is_contiguous(src0) &&
                  k > 0 && k <= src0->ne[0];
          }
@@ -101557,13 +102378,13 @@ index 000000000..f67db2adb
 +    print("classes written to", sys.argv[3])
 diff --git a/scripts/ptl/start-qwen38-server.sh b/scripts/ptl/start-qwen38-server.sh
 new file mode 100755
-index 000000000..fefb4176c
+index 000000000..2d3c7ff06
 --- /dev/null
 +++ b/scripts/ptl/start-qwen38-server.sh
-@@ -0,0 +1,111 @@
+@@ -0,0 +1,117 @@
 +#!/usr/bin/env bash
 +# Qwen3.8-Flash-Next Q2_0 + MTP on Intel Panther Lake (Arc B390 iGPU), llama.cpp SYCL.
-+# Verified setup: 47.6 tok/s decode over Agents4PLC (strict pass 65.0 %, baseline 65.0 %), prefill ~225 tok/s at 34k context.
++# Verified setup: 51.0 tok/s decode over Agents4PLC (strict pass 66.7 %, baseline 65.0 %), prefill ~225 tok/s at 34k context.
 +# No root needed.
 +#
 +# THINK=1 (default): thinking on, reasoning effort medium, --reasoning-preserve (agent use, e.g. opencode).
@@ -101627,12 +102448,18 @@ index 000000000..fefb4176c
 +    # GGML_SYCL_MMID_SHARED=1        Q2_0 experts of all MTP verify rows in one launch, a repeated expert read once
 +    # GGML_SYCL_TINY_FUSE=15         merged tiny kernels (unary chains, add runs, copy runs) + leaner conv-state concat/copy
 +    # GGML_SYCL_GDN_STATE_DIRECT=1   the recurrent-state kernel reads the state cache in place (no 3 MB gather per layer)
++    # 13 Nov:
++    # LLAMA_QWEN4EXP_MTP_CROP_FFN=1  the MTP drafter runs its FFN only for output rows (not for the catch-up rows)
++    # GGML_SYCL_GDN_LAZY=1           recurrent-state rollback snapshots kept as per-token update terms: one state
++    #                                copy per layer and step instead of one per verify row
++    # LLAMA_SPEC_RS_SEQ_NGRAM=1      rollback depth also covers the n-gram draft length (no state checkpoint)
 +    # LLAMA_QWEN4EXP_CONV_STATE_NOCONT=1   one copy less per recurrent-state slot
 +    # UR_L0_USE_DRIVER_INORDER_LISTS=1   the Level Zero driver keeps kernel order instead of the adapter (~5 us
 +    #                                    per launch, ~2,600 launches per step); L0IO=0 turns it off
 +    if [ "${L0IO:-1}" = 1 ]; then export UR_L0_USE_DRIVER_INORDER_LISTS=1; fi
 +    if [ "${KERN:-1}" = 1 ]; then
-+        export GGML_SYCL_MMID_SHARED=1 GGML_SYCL_TINY_FUSE=15 LLAMA_QWEN4EXP_CONV_STATE_NOCONT=1 GGML_SYCL_GDN_STATE_DIRECT=1
++        export GGML_SYCL_MMID_SHARED=1 GGML_SYCL_TINY_FUSE=15 LLAMA_QWEN4EXP_CONV_STATE_NOCONT=1 GGML_SYCL_GDN_STATE_DIRECT=1 \
++        LLAMA_QWEN4EXP_MTP_CROP_FFN=1 GGML_SYCL_GDN_LAZY=1 LLAMA_SPEC_RS_SEQ_NGRAM=1
 +    fi
 +fi
 +# Drafts: MTP, 5 tokens, p-min 0.5. SPEC=1 (default): n-gram drafts of 3-7 tokens in front of MTP (re-emitted code)
@@ -101888,7 +102715,7 @@ index cdf060db2..47ade97c9 100644
      void load_swa_pattern(llama_model_loader & ml, uint32_t n_pattern, bool dense_first = false);
  
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index fc9acd43e..3b0d02dd5 100644
+index fc9acd43e..d7b8e19d0 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
 @@ -4,6 +4,7 @@
@@ -101953,7 +102780,44 @@ index fc9acd43e..3b0d02dd5 100644
      cb(cur, "result_output", -1);
      res->t_logits = cur;
  }
-@@ -628,7 +660,18 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
+@@ -611,13 +643,30 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
+     cur    = build_layer_attn(inp_hyb->get_attn(), mctx_hyb, inp_kpool, cur, inp_pos, sections, il);
+     res_hc = build_hc_combine(res_hc, cur, inject, il);
+ 
+-    cur    = build_hc_mix(res_hc, layer.hc_ffn_norm, layer.hc_ffn_down, layer.hc_ffn_up, layer.hc_ffn_inject, &inject, il);
+-    cur    = build_layer_ffn(cur, il);
+-    res_hc = build_hc_combine(res_hc, cur, inject, il);
++    // LLAMA_QWEN4EXP_MTP_CROP_FFN=1: the attention above fills the draft KV for every token, but the FFN and the head
++    // are only read for the output rows, so narrow to them first. The catch-up decode after a verify step has no
++    // output row and skips the FFN (its experts were ~70 % of that graph).
++    static const bool crop_ffn = getenv("LLAMA_QWEN4EXP_MTP_CROP_FFN") != nullptr &&
++                                 atoi(getenv("LLAMA_QWEN4EXP_MTP_CROP_FFN")) != 0;
++    const bool    cropped = crop_ffn && crop_before_nextn(inp_out_ids) && (int64_t) n_outputs < n_tokens;
++    const int64_t n_rows  = cropped ? (int64_t) n_outputs : n_tokens;
++    if (cropped) {
++        res_hc = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, res_hc, n_embd*hc, n_tokens), inp_out_ids);
++        res_hc = ggml_reshape_3d(ctx0, res_hc, n_embd, hc, n_rows);
++    }
+ 
+-    // the next draft step reads this residual as its h
+-    ggml_tensor * flat     = ggml_reshape_2d(ctx0, res_hc, n_embd*hc, n_tokens);
+-    ggml_tensor * flat_out = inp_out_ids ? ggml_get_rows(ctx0, flat, inp_out_ids) : flat;
++    ggml_tensor * flat;
++    if (cropped && n_rows == 0) {
++        flat = ggml_reshape_2d(ctx0, res_hc, n_embd*hc, n_rows);
++    } else {
++        cur    = build_hc_mix(res_hc, layer.hc_ffn_norm, layer.hc_ffn_down, layer.hc_ffn_up, layer.hc_ffn_inject, &inject, il);
++        cur    = build_layer_ffn(cur, il);
++        res_hc = build_hc_combine(res_hc, cur, inject, il);
++
++        // the next draft step reads this residual as its h
++        flat = ggml_reshape_2d(ctx0, res_hc, n_embd*hc, n_rows);
++    }
++    ggml_tensor * flat_out = (inp_out_ids && !cropped) ? ggml_get_rows(ctx0, flat, inp_out_ids) : flat;
+     res->t_h_nextn = cparams.embeddings_nextn_masked ? flat_out : flat;
+     cb(res->t_h_nextn, "h_nextn", il);
+     ggml_build_forward_expand(gf, res->t_h_nextn);
+@@ -628,7 +677,18 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
      cb(cur, "result_norm", -1);
      res->t_embd = cur;
  
@@ -101973,7 +102837,7 @@ index fc9acd43e..3b0d02dd5 100644
      cb(cur, "result_output", -1);
      res->t_logits = cur;
  }
-@@ -1369,7 +1412,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
+@@ -1369,7 +1429,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
                  conv_states_all->nb[1],
                  (slot * mem_size + kv_head) * row_size);
  
