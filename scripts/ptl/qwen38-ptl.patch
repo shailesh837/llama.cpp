@@ -1,9 +1,9 @@
 diff --git a/README-PTL-Qwen38.md b/README-PTL-Qwen38.md
 new file mode 100644
-index 000000000..fabdb9fea
+index 000000000..a285a745f
 --- /dev/null
 +++ b/README-PTL-Qwen38.md
-@@ -0,0 +1,217 @@
+@@ -0,0 +1,219 @@
 +# Qwen3.8-Flash-Next on Intel Panther Lake (llama.cpp SYCL)
 +
 +This fork runs Qwen3.8-Flash-Next (Q2_0, 177B MoE) with MTP speculative decoding on the Arc B390 iGPU of Panther Lake. Upstream base: tag `b11836` (commit `f5027fb21`). Branch: `ptl-qwen38`.
@@ -21,7 +21,8 @@ index 000000000..fabdb9fea
 +| 11 Nov: + MTP drafter vocabulary shortlist | 34.5 over Agents4PLC | 66.7 % (67.5 %) |
 +| 12 Nov: + shared-expert verify kernel, tiny-kernel fusion, n-gram + probabilistic drafts | 41.1 over Agents4PLC | 67.5 % (68.4 %) |
 +| 13 Nov: + Level Zero in-order lists, state read in place, leaner conv-state kernels | 47.6 over Agents4PLC | 65.0 % (65.8 %) |
-+| **13 Nov: + drafter FFN only for output rows, lazy recurrent-state snapshots (start script default)** | **51.0 over Agents4PLC** | **66.7 % (67.5 %)** |
++| 13 Nov: + drafter FFN only for output rows, lazy recurrent-state snapshots | 51.0 over Agents4PLC | 66.7 % (67.5 %) |
++| **14 Nov: + MTP drafts of up to 7 tokens on confident stretches (start script default)** | **53.3 over Agents4PLC** | **66.7 % (67.5 %)** |
 +
 +Agent-style requests (opencode-like CODESYS prompts, thinking on, reasoning effort medium, temperature 1.0): 25.4 tok/s with the 8 Nov setup, 28.5 with the 11 Nov parts, 35.0 with the 12 Nov parts, 40.0 with `UR_L0_USE_DRIVER_INORDER_LISTS=1`, 41.0 with the 13 Nov state-read and conv-state kernels, **43.7 with the drafter and lazy-snapshot changes** (start script default).
 +
@@ -64,6 +65,7 @@ index 000000000..fabdb9fea
 +| `LLAMA_QWEN4EXP_MTP_CROP_FFN=1` | `src/models/qwen4exp.cpp` | The MTP drafter narrows to its output rows before the FFN. The catch-up decode after every verify step (it only fills the drafter's attention cache, no output row) then skips the FFN, whose experts were ~70 % of that graph. The skipped values were never read. 3.4 ms less per MTP step, +3.9 %. |
 +| `GGML_SYCL_GDN_LAZY=1` | `ggml/src/ggml-sycl/gated_delta_net.cpp`, `.hpp`, `ggml-sycl.cpp` | Rollback snapshots of the recurrent state as update terms. A verify step of n rows wrote n copies of every recurrent layer's state (3 MB x 36 layers per copy). Now slot 0 keeps the state before the step and a small stash keeps k, delta and exp(g) per token; the next step replays the tokens that were kept and writes one copy. Any other access to the state cache (tensor get/set/copy/memset, buffer clear, another graph node) first turns the cell back into snapshots. Same values: `=2` runs the snapshot kernel on a shadow cache and compares (8,444 checks, 0 differ). Needs `GGML_SYCL_GDN_STATE_DIRECT=1`. |
 +| `LLAMA_SPEC_RS_SEQ_NGRAM=1` | `common/common.h` | The rollback depth (`n_rs_seq`) also covers the n-gram draft length (up to 8) instead of the MTP draft length only. Otherwise the server takes a state checkpoint before every n-gram draft longer than the MTP n-max, which reads all recurrent states back to the host. With the two switches above: 2.9 ms less per step, +2.1 %. |
++| `LLAMA_MTP_DRAFT_EXT="N,P"` | `common/speculative.cpp`, `common/common.h` | An MTP draft grows from `--spec-draft-n-max` (5) to N (7) tokens as long as every token drafted so far had a top probability of at least P (0.9). A flat n-max of 6 gave ~+1 %, because the extra draft is wasted on uncertain text; gating on confidence spends it only on sure stretches (boilerplate, declarations). The rollback depth follows N. Lossless (the target verifies every token). Thinking off: new code +9 %, full-code edit +13 %; Agents4PLC 51.0 -> 53.3 tok/s (4.80 -> 5.41 tokens per step). Keep N at 7 or less (8 verify rows). |
 +| `GGML_SYCL_FA_SKIP_MASKED=1` | `ggml/src/ggml-sycl/fattn-tile.hpp` | Flash attention skips KV tiles whose mask is -inf for every row of the block. |
 +| (tests) | `tests/test-backend-ops.cpp` | Perf and eval cases for the model's shapes: Q2_0 experts 640x2560 / 2560x640 (512 experts / 10 used, 1-2048 tokens), BF16 hyper-connection shapes, sparse attention with 2-8 rows. |
 +| (tool) | `scripts/ptl/bf16_to_q8.cpp` | Rewrites the first model split with the hyper-connection and router tensors (240 tensors) in Q8_0 instead of BF16. |
@@ -174,7 +176,7 @@ index 000000000..fabdb9fea
 +export GGML_SYCL_XMX_PTL=1 LLAMA_MTP_SHORTLIST=scripts/ptl/mtp-shortlist-plc-96k.txt
 +export GGML_SYCL_MMID_SHARED=1 GGML_SYCL_TINY_FUSE=15 LLAMA_QWEN4EXP_CONV_STATE_NOCONT=1 GGML_SYCL_GDN_STATE_DIRECT=1
 +export UR_L0_USE_DRIVER_INORDER_LISTS=1
-+export LLAMA_QWEN4EXP_MTP_CROP_FFN=1 GGML_SYCL_GDN_LAZY=1 LLAMA_SPEC_RS_SEQ_NGRAM=1
++export LLAMA_QWEN4EXP_MTP_CROP_FFN=1 GGML_SYCL_GDN_LAZY=1 LLAMA_SPEC_RS_SEQ_NGRAM=1 LLAMA_MTP_DRAFT_EXT=7,0.9
 +taskset -c 0-3 build/bin/llama-server \
 +    -m ~/models/Q2_0_hcq8/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf \
 +    -lm dio -lzm on -ngl 99 -fa on --jinja --reasoning on --reasoning-preserve --reasoning-effort medium \
@@ -193,7 +195,7 @@ index 000000000..fabdb9fea
 +- `-c 65536` leaves ~14 GB of RAM free after the load on a 61 GiB machine. The model is served as `qwen38-flash-next-q2_0-mtp`.
 +- Prompt processing: ~225 tok/s on long prompts (34k tokens in ~150 s). Follow-up turns reuse the cached prefix, so only new content (file reads, tool results) is processed.
 +- `--reasoning-preserve` (the llama-server default) keeps earlier assistant turns in the history exactly as they were generated. With `--no-reasoning-preserve` the chat template drops the think block of every assistant turn before the last user message. In agent sessions (opencode, tool calls) the turns of the previous round were cached with their think block, so the next user message no longer matches the KV cache from the first assistant turn of that round, and all tool results since then are processed again (reported: 75-86 s instead of ~4 s per follow-up at long context). Plain chat, 5 follow-ups at 8-13k context: 160 tokens of prefill with preserve vs 245-1,209 without.
-+- Thinking: the start script runs with thinking on and `--reasoning-effort medium` (`THINK=0` turns thinking off). The Qwen3.8 chat template defaults to `xhigh`; in an opencode benchmark on pick & place CODESYS tasks, medium gave better results than xhigh. Thinking text decodes slower than code (lower draft acceptance), so agent turns run at ~44 tok/s rather than the 51 of Agents4PLC (no thinking, temperature 0). Use the sampling defaults of the model (temperature 1.0, top-k 20, top-p 0.95, in the GGUF).
++- Thinking: the start script runs with thinking on and `--reasoning-effort medium` (`THINK=0` turns thinking off). The Qwen3.8 chat template defaults to `xhigh`; in an opencode benchmark on pick & place CODESYS tasks, medium gave better results than xhigh. Thinking text decodes slower than code (lower draft acceptance), so agent turns run at ~45 tok/s rather than the 53 of Agents4PLC (no thinking, temperature 0). Use the sampling defaults of the model (temperature 1.0, top-k 20, top-p 0.95, in the GGUF).
 +- `-cram 0` turns off the host-RAM prompt cache, which grew 120-230 MB per request until 8 GB and pushed the machine into swap with `-c 65536`. SYCL graphs (`GGML_SYCL_ENABLE_GRAPH`) stay off: with MTP no graph is replayed and the graph cache grows ~110 MB per request.
 +- Drafts: n-gram drafts of 3-7 tokens (text the model re-emits, e.g. a file rewrite) go before the MTP drafts, and MTP drafts are sampled (`probabilistic`). Keep the n-gram `n-max` at 7 or less: a verify of more than 8 rows leaves the 8-row fast paths (small-batch experts, 8-column mat-vec, sparse attention rows) and gets much slower. In the start script `SPEC=0` goes back to MTP only with greedy drafts, `KERN=0` turns off the three 12 Nov kernel switches.
 +- `UR_L0_USE_DRIVER_INORDER_LISTS=1` (a oneAPI Unified Runtime setting, no code change): the Level Zero driver keeps the kernels of the in-order queue in order itself instead of the adapter tracking every launch. A decode step has ~2,600 small kernels, and the adapter's bookkeeping cost ~5 us each: 13 ms less per MTP step, +14 % decode. The newer adapter (`UR_LOADER_USE_LEVEL_ZERO_V2=1`) gave the same speed; the script keeps the adapter all other measurements used. `L0IO=0` turns it off.
@@ -222,7 +224,7 @@ index 000000000..fabdb9fea
 +- The first server launch after a reboot was ~17 % slower in one test (plain decode 11.3 vs 13.5 tok/s with the Q2_0 kernel); later launches were at full speed. Not yet explained.
 +- Output text differs between runs even at temperature 0 (non-deterministic GPU reductions), so compare accuracy with a benchmark, not with identical text.
 diff --git a/common/common.h b/common/common.h
-index 70d6a671f..a455bcf92 100644
+index 70d6a671f..fdaf0529b 100644
 --- a/common/common.h
 +++ b/common/common.h
 @@ -17,6 +17,7 @@
@@ -233,7 +235,7 @@ index 70d6a671f..a455bcf92 100644
  #include <filesystem>
  #include <fstream>
  #include <cstdio>
-@@ -403,7 +404,19 @@ struct common_params_speculative {
+@@ -403,7 +404,26 @@ struct common_params_speculative {
              return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
          });
  
@@ -250,10 +252,73 @@ index 70d6a671f..a455bcf92 100644
 +            std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_NGRAM_MOD) != types.end()) {
 +            n = std::max(n, (uint32_t) ngram_mod.n_max);
 +        }
++        // LLAMA_MTP_DRAFT_EXT="N,P": MTP drafts of up to N tokens need rollback snapshots for N
++        if (const char * x = getenv("LLAMA_MTP_DRAFT_EXT")) {
++            const int nx = atoi(x);
++            if (nx > 0 && nx <= 8) {
++                n = std::max(n, (uint32_t) nx);
++            }
++        }
 +        return n;
      }
  };
  
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 4305ac6ac..0227497b4 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -1524,6 +1524,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+     std::vector<int>                i_last;
+     std::vector<std::vector<float>> chain_h;
+ 
++    // LLAMA_MTP_DRAFT_EXT="N,P": a draft may grow from n_max to N tokens as long as every token drafted so far had
++    // a top probability of at least P (confident stretches such as boilerplate); other drafts stop at n_max
++    int32_t            n_ext = 0;
++    float              p_ext = 1.0f;
++    std::vector<float> p_low;   // per seq: lowest top probability of the current draft
++
+     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
+         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
+         , params(params.draft)
+@@ -1590,6 +1596,19 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         }
+         this->n_max = this->params.n_max;
+ 
++        if (const char * e = getenv("LLAMA_MTP_DRAFT_EXT")) {
++            int   n = 0;
++            float p = 1.0f;
++            if (sscanf(e, "%d,%f", &n, &p) == 2 && n > this->params.n_max && !chain_heads) {
++                n_ext       = n;
++                p_ext       = p;
++                this->n_max = n_ext;
++                SPC_INF("MTP drafts extend from %d to %d tokens while every top probability is >= %.2f\n",
++                        this->params.n_max, n_ext, (double) p_ext);
++            }
++        }
++        p_low.assign(n_seq, 1.0f);
++
+         pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
+ 
+         i_last.assign(n_seq, -1);
+@@ -1785,6 +1804,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+             batch.set_embd_state(idx, { pending_h[seq_id].data(), 1, (size_t) n_embd });
+ 
+             i_last[seq_id] = idx;
++            p_low[seq_id]  = 1.0f;
+ 
+             if (chain_heads) {
+                 chain_h[seq_id].assign(pending_h[seq_id].begin(), pending_h[seq_id].end());
+@@ -1861,7 +1881,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                     dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
+                 }
+ 
+-                if (params.n_max <= (int) result.size()) {
++                p_low[seq_id] = std::min(p_low[seq_id], cur_p->data[0].p);
++                const int n_lim = (n_ext > 0 && p_low[seq_id] >= p_ext) ? n_ext : params.n_max;
++                if (n_lim <= (int) result.size()) {
+                     drafting[seq_id] = false;
+                     n_drafting--;
+                     continue;
 diff --git a/ggml/src/ggml-sycl/common.hpp b/ggml/src/ggml-sycl/common.hpp
 index 8f2f892bc..8b4b2b234 100644
 --- a/ggml/src/ggml-sycl/common.hpp
@@ -102378,13 +102443,13 @@ index 000000000..f67db2adb
 +    print("classes written to", sys.argv[3])
 diff --git a/scripts/ptl/start-qwen38-server.sh b/scripts/ptl/start-qwen38-server.sh
 new file mode 100755
-index 000000000..2d3c7ff06
+index 000000000..96f00530b
 --- /dev/null
 +++ b/scripts/ptl/start-qwen38-server.sh
-@@ -0,0 +1,117 @@
+@@ -0,0 +1,120 @@
 +#!/usr/bin/env bash
 +# Qwen3.8-Flash-Next Q2_0 + MTP on Intel Panther Lake (Arc B390 iGPU), llama.cpp SYCL.
-+# Verified setup: 51.0 tok/s decode over Agents4PLC (strict pass 66.7 %, baseline 65.0 %), prefill ~225 tok/s at 34k context.
++# Verified setup: 53.3 tok/s decode over Agents4PLC (strict pass 66.7 %, baseline 65.0 %), prefill ~225 tok/s at 34k context.
 +# No root needed.
 +#
 +# THINK=1 (default): thinking on, reasoning effort medium, --reasoning-preserve (agent use, e.g. opencode).
@@ -102470,6 +102535,9 @@ index 000000000..2d3c7ff06
 +    SPEC_ARGS="--spec-type ngram-mod,draft-mtp --spec-ngram-mod-n-min 3 --spec-ngram-mod-n-max 7"
 +    SPEC_ARGS="$SPEC_ARGS --spec-ngram-mod-n-match 24 --spec-draft-n-max 5 --spec-draft-p-min 0.5"
 +    SPEC_ARGS="$SPEC_ARGS --spec-draft-sampling probabilistic"
++    # LLAMA_MTP_DRAFT_EXT="7,0.9": an MTP draft grows from 5 to 7 tokens while every drafted token had a top
++    # probability of at least 0.9 (confident stretches); EXT=0 turns it off
++    if [ "${EXT:-1}" = 1 ]; then export LLAMA_MTP_DRAFT_EXT=7,0.9; fi
 +fi
 +if [ "${THINK:-1}" = 1 ]; then
 +    THINK_ARGS="--reasoning on --reasoning-preserve --reasoning-effort ${EFFORT:-medium}"
@@ -102851,7 +102919,7 @@ index fc9acd43e..d7b8e19d0 100644
  
      return conv_input;
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 0fc5c0b5f..953da2261 100644
+index 0fc5c0b5f..39b15bbe5 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -1536,6 +1536,16 @@ struct test_case {
@@ -102912,7 +102980,7 @@ index 0fc5c0b5f..953da2261 100644
      return test_cases;
  }
  #ifdef _MSC_VER
-@@ -12936,6 +12973,42 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -12936,6 +12973,51 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
      }
  
  
@@ -102949,6 +103017,15 @@ index 0fc5c0b5f..953da2261 100644
 +            if (t == GGML_TYPE_Q5_K) {
 +                test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 248320, bs, 2560, {1, 1}, {1, 1}));
 +            }
++        }
++    }
++    // hyper-connection down [10240 -> 320] and up [320 -> 10240] matrices at fewer bits than Q8_0
++    for (int bs : {1, 6}) {
++        for (ggml_type t : {GGML_TYPE_Q8_0, GGML_TYPE_Q6_K, GGML_TYPE_Q5_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, GGML_TYPE_Q4_0}) {
++            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 320, bs, 10240, {1, 1}, {1, 1}));
++        }
++        for (ggml_type t : {GGML_TYPE_Q8_0, GGML_TYPE_Q5_0, GGML_TYPE_Q4_0}) {
++            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 10240, bs, 320, {1, 1}, {1, 1}));
 +        }
 +    }
 +

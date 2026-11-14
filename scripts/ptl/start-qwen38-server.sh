@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Qwen3.8-Flash-Next Q2_0 + MTP on Intel Panther Lake (Arc B390 iGPU), llama.cpp SYCL.
-# Verified setup: 51.0 tok/s decode over Agents4PLC (strict pass 66.7 %, baseline 65.0 %), prefill ~225 tok/s at 34k context.
+# Verified setup: 53.3 tok/s decode over Agents4PLC (strict pass 66.7 %, baseline 65.0 %), prefill ~225 tok/s at 34k context.
 # No root needed.
 #
 # THINK=1 (default): thinking on, reasoning effort medium, --reasoning-preserve (agent use, e.g. opencode).
@@ -86,6 +86,9 @@ if [ "${SPEC:-1}" = 1 ]; then
     SPEC_ARGS="--spec-type ngram-mod,draft-mtp --spec-ngram-mod-n-min 3 --spec-ngram-mod-n-max 7"
     SPEC_ARGS="$SPEC_ARGS --spec-ngram-mod-n-match 24 --spec-draft-n-max 5 --spec-draft-p-min 0.5"
     SPEC_ARGS="$SPEC_ARGS --spec-draft-sampling probabilistic"
+    # LLAMA_MTP_DRAFT_EXT="7,0.9": an MTP draft grows from 5 to 7 tokens while every drafted token had a top
+    # probability of at least 0.9 (confident stretches); EXT=0 turns it off
+    if [ "${EXT:-1}" = 1 ]; then export LLAMA_MTP_DRAFT_EXT=7,0.9; fi
 fi
 if [ "${THINK:-1}" = 1 ]; then
     THINK_ARGS="--reasoning on --reasoning-preserve --reasoning-effort ${EFFORT:-medium}"

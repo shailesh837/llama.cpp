@@ -13008,6 +13008,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             }
         }
     }
+    // hyper-connection down [10240 -> 320] and up [320 -> 10240] matrices at fewer bits than Q8_0
+    for (int bs : {1, 6}) {
+        for (ggml_type t : {GGML_TYPE_Q8_0, GGML_TYPE_Q6_K, GGML_TYPE_Q5_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, GGML_TYPE_Q4_0}) {
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 320, bs, 10240, {1, 1}, {1, 1}));
+        }
+        for (ggml_type t : {GGML_TYPE_Q8_0, GGML_TYPE_Q5_0, GGML_TYPE_Q4_0}) {
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 10240, bs, 320, {1, 1}, {1, 1}));
+        }
+    }
 
     return test_cases;
 }

@@ -416,6 +416,13 @@ struct common_params_speculative {
             std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_NGRAM_MOD) != types.end()) {
             n = std::max(n, (uint32_t) ngram_mod.n_max);
         }
+        // LLAMA_MTP_DRAFT_EXT="N,P": MTP drafts of up to N tokens need rollback snapshots for N
+        if (const char * x = getenv("LLAMA_MTP_DRAFT_EXT")) {
+            const int nx = atoi(x);
+            if (nx > 0 && nx <= 8) {
+                n = std::max(n, (uint32_t) nx);
+            }
+        }
         return n;
     }
 };

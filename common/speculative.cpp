@@ -1524,6 +1524,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
+    // LLAMA_MTP_DRAFT_EXT="N,P": a draft may grow from n_max to N tokens as long as every token drafted so far had
+    // a top probability of at least P (confident stretches such as boilerplate); other drafts stop at n_max
+    int32_t            n_ext = 0;
+    float              p_ext = 1.0f;
+    std::vector<float> p_low;   // per seq: lowest top probability of the current draft
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
         , params(params.draft)
@@ -1589,6 +1595,19 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
         this->n_max = this->params.n_max;
+
+        if (const char * e = getenv("LLAMA_MTP_DRAFT_EXT")) {
+            int   n = 0;
+            float p = 1.0f;
+            if (sscanf(e, "%d,%f", &n, &p) == 2 && n > this->params.n_max && !chain_heads) {
+                n_ext       = n;
+                p_ext       = p;
+                this->n_max = n_ext;
+                SPC_INF("MTP drafts extend from %d to %d tokens while every top probability is >= %.2f\n",
+                        this->params.n_max, n_ext, (double) p_ext);
+            }
+        }
+        p_low.assign(n_seq, 1.0f);
 
         pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
 
@@ -1785,6 +1804,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             batch.set_embd_state(idx, { pending_h[seq_id].data(), 1, (size_t) n_embd });
 
             i_last[seq_id] = idx;
+            p_low[seq_id]  = 1.0f;
 
             if (chain_heads) {
                 chain_h[seq_id].assign(pending_h[seq_id].begin(), pending_h[seq_id].end());
@@ -1861,7 +1881,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
                 }
 
-                if (params.n_max <= (int) result.size()) {
+                p_low[seq_id] = std::min(p_low[seq_id], cur_p->data[0].p);
+                const int n_lim = (n_ext > 0 && p_low[seq_id] >= p_ext) ? n_ext : params.n_max;
+                if (n_lim <= (int) result.size()) {
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;
