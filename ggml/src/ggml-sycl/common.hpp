@@ -448,6 +448,14 @@ void ggml_sycl_free_device(void *ptr, sycl::queue &q);
 
 void release_extra_gpu(ggml_tensor_extra_gpu * extra, std::vector<queue_ptr> streams={});
 
+// GGML_SYCL_MMID_NEW_FILE=<path> (A/B inside one launch): the MMID_INPLACE / MSPLIT / PACKT switches apply only
+// while <path> exists. Unset: they apply as set.
+#include <unistd.h>
+inline bool ggml_sycl_mmid_new_gate() {
+    static const char * f = getenv("GGML_SYCL_MMID_NEW_FILE");
+    return f == nullptr || access(f, F_OK) == 0;
+}
+
 struct mmid_row_mapping {
     int32_t i1;
     int32_t i2;

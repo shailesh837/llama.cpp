@@ -6226,6 +6226,16 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
         opt_for_reorder_id(&ctx, src0);
     }
 
+    // GGML_SYCL_MMID_TIMING=1 (experiment): wait after every stage of the routed path and print the stage times
+    static const bool mmid_timing = getenv("GGML_SYCL_MMID_TIMING") != nullptr;
+    double mmid_t[8] = {0}; int mmid_n = 0;
+    auto mmid_tick = [&]() {
+        if (mmid_timing) {
+            stream->wait();
+            mmid_t[mmid_n++] = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        }
+    };
+    mmid_tick();
     std::vector<char> ids_host(ggml_nbytes(ids));
     const char * ids_dev = (const char *) ids->data;
 
@@ -6294,8 +6304,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
         // the sources (slot/token pairs) of contiguous rows to guide k_copy_src1_to_contiguous
         std::vector<mmid_row_mapping> & routed_row_src = ctx.mmid_row_mapping_host;
 
+        mmid_tick();  // ids on the host
         mmid_counting_sort_rows(ids, ids_host.data(), n_ids, n_as, n_routed_rows,
                                 expert_row_counts, expert_row_offsets, routed_row_src);
+        mmid_tick();  // host sort
 
         ggml_sycl_pool_alloc<mmid_row_mapping> dev_row_mapping(ctx.pool(), n_routed_rows);
         SYCL_CHECK(CHECK_TRY_ERROR(
@@ -6304,7 +6316,34 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
         const unsigned int max_work_group_size = ggml_sycl_info().max_work_group_sizes[ctx.device];
         assert(max_work_group_size % (WARP_SIZE * WARP_SIZE) == 0);
 
-        {
+        const bool grouped_ok = ggml_is_contiguous(src0) && src1->type == GGML_TYPE_F32 &&
+            dst->type == GGML_TYPE_F32 && nb11 == sizeof(float)*ne10 && nb1 == sizeof(float)*ne0;
+        // the grouped GEMM reads the reorder (SoA) layout faster, and the first decode step installs it
+        // anyway: install it here already, so prefill does not depend on whether a decode ran before
+        auto grouped_prepare = [&]() {
+            if (g_ggml_sycl_dynamic_precision != GGML_SYCL_DYNAMIC_PRECISION_F32 &&
+                ggml_sycl_xmx_gather_type_enabled(src0->type)) {
+                opt_for_reorder_id(&ctx, src0);
+            }
+            return src0->extra && ((const ggml_tensor_extra_gpu *) src0->extra)->optimized_feature.reorder;
+        };
+        // GGML_SYCL_MMID_INPLACE=1: the grouped GEMM reads src1 rows and writes dst rows in place through the
+        // row map, so the gather and scatter copies are skipped (same arithmetic). Off by default.
+        static const bool mmid_inplace_env = getenv("GGML_SYCL_MMID_INPLACE") && atoi(getenv("GGML_SYCL_MMID_INPLACE")) != 0;
+        const bool mmid_inplace = mmid_inplace_env && ggml_sycl_mmid_new_gate();
+        bool grouped_inplace = false;
+        if (mmid_inplace && grouped_ok) {
+            const bool src0_reordered = grouped_prepare();
+            const ggml_sycl_mmid_inplace ip = { dev_row_mapping.get(), src1_original, ne11, nb11, nb12,
+                                                dst_original, nb1, nb2 };
+            grouped_inplace = ggml_sycl_grouped_dequant_gemm(src0->type, src0_reordered, src0_original, nb02,
+                                                             (const float *) src1_contiguous.get(), ggml_sycl_src1_prec(dst),
+                                                             (float *) dst_contiguous.get(),
+                                                             expert_row_offsets.data(), n_as, ne01, ne10, n_routed_rows,
+                                                             ctx.mmid_tile_schedule_host, ctx.pool(), stream, &ip);
+        }
+
+        if (!grouped_inplace) {
             sycl::range<3> block_dims(1, 1, std::min((unsigned int)ne10, max_work_group_size));
             sycl::range<3> grid_dims(1, 1, n_routed_rows);
             stream->submit([&](sycl::handler &cgh) {
@@ -6325,17 +6364,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
             });
         }
 
-        bool grouped = false;
-        if (ggml_is_contiguous(src0) && src1->type == GGML_TYPE_F32 &&
-            dst->type == GGML_TYPE_F32 && nb11 == sizeof(float)*ne10 && nb1 == sizeof(float)*ne0) {
-            // the grouped GEMM reads the reorder (SoA) layout faster, and the first decode step installs it
-            // anyway: install it here already, so prefill does not depend on whether a decode ran before
-            if (g_ggml_sycl_dynamic_precision != GGML_SYCL_DYNAMIC_PRECISION_F32 &&
-                ggml_sycl_xmx_gather_type_enabled(src0->type)) {
-                opt_for_reorder_id(&ctx, src0);
-            }
-            const bool src0_reordered =
-                src0->extra && ((const ggml_tensor_extra_gpu *) src0->extra)->optimized_feature.reorder;
+        mmid_tick();  // row map copy + gather of src1
+        bool grouped = grouped_inplace;
+        if (!grouped && grouped_ok) {
+            const bool src0_reordered = grouped_prepare();
             grouped = ggml_sycl_grouped_dequant_gemm(src0->type, src0_reordered, src0_original, nb02,
                                                      (const float *) src1_contiguous.get(), ggml_sycl_src1_prec(dst),
                                                      (float *) dst_contiguous.get(),
@@ -6372,7 +6404,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
             ggml_sycl_mul_mat(ctx, &src0_row, &src1_row, &dst_row);
         }
 
-        {
+        mmid_tick();  // GEMM (grouped or per expert)
+        if (!grouped_inplace) {
             sycl::range<3> block_dims(1, 1, std::min((unsigned int)ne0, max_work_group_size));
             sycl::range<3> grid_dims(1, 1, n_routed_rows);
             stream->submit([&](sycl::handler &cgh) {
@@ -6390,6 +6423,12 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
                                                    ne0, nb1, nb2, item_ct1);
                     });
             });
+        }
+        mmid_tick();  // scatter of dst
+        if (mmid_timing && mmid_n == 6) {
+            fprintf(stderr, "mmid timing M=%lld K=%lld rows=%lld grouped=%d: ids %.2f sort %.2f gather %.2f gemm %.2f scatter %.2f total %.2f ms\n",
+                    (long long) ne01, (long long) ne10, (long long) n_routed_rows, (int) grouped,
+                    mmid_t[1]-mmid_t[0], mmid_t[2]-mmid_t[1], mmid_t[3]-mmid_t[2], mmid_t[4]-mmid_t[3], mmid_t[5]-mmid_t[4], mmid_t[5]-mmid_t[0]);
         }
     }
 }

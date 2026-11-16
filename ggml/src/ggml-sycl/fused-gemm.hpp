@@ -87,10 +87,19 @@ bool ggml_sycl_fused_dequant_gemm(ggml_type src0_type, bool src0_reordered, cons
 // reordered: each expert slice is in the reorder (SoA) layout of reorder_qw().
 // dst[n*M + m] = sum_k dequant(src0_e)[m*K + k] * src1[n*K + k]
 // Returns false when the case is not handled (type, layout, device, precision, or shape).
+// In place (GGML_SYCL_MMID_INPLACE): routed row r reads src1 at src1 + (map[r].i1 % ne11)*nb11 + map[r].i2*nb12
+// and writes dst at dst + map[r].i1*nb1 + map[r].i2*nb2 (bytes); no contiguous copies. Same arithmetic.
+struct ggml_sycl_mmid_inplace {
+    const mmid_row_mapping * map;  // device, one entry per routed row
+    const char * src1; int64_t ne11; size_t nb11, nb12;
+    char * dst; size_t nb1, nb2;
+};
+
 bool ggml_sycl_grouped_dequant_gemm(ggml_type src0_type, bool reordered, const void * src0_base, size_t expert_stride,
                                     const float * src1, int32_t src1_prec, float * dst,
                                     const int64_t * expert_row_offsets, int64_t n_as, int64_t M, int64_t K,
                                     int64_t total_rows, std::vector<ggml_sycl_gg_tile> & tiles,
-                                    ggml_sycl_pool & pool, dpct::queue_ptr stream);
+                                    ggml_sycl_pool & pool, dpct::queue_ptr stream,
+                                    const ggml_sycl_mmid_inplace * inplace = nullptr);
 
 #endif // GGML_SYCL_FUSED_GEMM_HPP
