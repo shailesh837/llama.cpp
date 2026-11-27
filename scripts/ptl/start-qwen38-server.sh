@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Qwen3.8-Flash-Next Q2_0 + MTP on Intel Panther Lake (Arc B390 iGPU), llama.cpp SYCL.
-# Verified setup: 53.3 tok/s decode over Agents4PLC (strict pass 66.7 %, baseline 65.0 %), prefill ~225 tok/s at 34k context.
+# Verified setup: 58.1 tok/s decode over Agents4PLC (strict pass 70.1 %, prompt v3 + repair loop; 26 Nov), prefill ~225 tok/s at 34k context.
 # No root needed.
 #
 # THINK=1 (default): thinking on, reasoning effort medium, --reasoning-preserve (agent use, e.g. opencode).
@@ -70,12 +70,15 @@ if [ "$NEW" = 1 ]; then
     #                                copy per layer and step instead of one per verify row
     # LLAMA_SPEC_RS_SEQ_NGRAM=1      rollback depth also covers the n-gram draft length (no state checkpoint)
     # LLAMA_QWEN4EXP_CONV_STATE_NOCONT=1   one copy less per recurrent-state slot
+    # 26 Nov:
+    # GGML_SYCL_MMID_SHARED_V2=1     faster setup of the shared verify kernel (ids scanned by the whole sub-group,
+    #                                fewer registers); same results bit for bit, +5.9 %
     # UR_L0_USE_DRIVER_INORDER_LISTS=1   the Level Zero driver keeps kernel order instead of the adapter (~5 us
     #                                    per launch, ~2,600 launches per step); L0IO=0 turns it off
     if [ "${L0IO:-1}" = 1 ]; then export UR_L0_USE_DRIVER_INORDER_LISTS=1; fi
     if [ "${KERN:-1}" = 1 ]; then
         export GGML_SYCL_MMID_SHARED=1 GGML_SYCL_TINY_FUSE=15 LLAMA_QWEN4EXP_CONV_STATE_NOCONT=1 GGML_SYCL_GDN_STATE_DIRECT=1 \
-        LLAMA_QWEN4EXP_MTP_CROP_FFN=1 GGML_SYCL_GDN_LAZY=1 LLAMA_SPEC_RS_SEQ_NGRAM=1
+        LLAMA_QWEN4EXP_MTP_CROP_FFN=1 GGML_SYCL_GDN_LAZY=1 LLAMA_SPEC_RS_SEQ_NGRAM=1 GGML_SYCL_MMID_SHARED_V2=1
     fi
 fi
 # Drafts: MTP, 5 tokens, p-min 0.5. SPEC=1 (default): n-gram drafts of 3-7 tokens in front of MTP (re-emitted code)
